@@ -1,0 +1,13 @@
+[package]
+name = "procodile-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { version = "4.5.58", features = ["derive"] }
+rustyline = "17.0.2"
+shlex = "1.3.0"
+
+[[bin]]
+name = "procodile"   # This is the name of the actual executable
+path = "src/main.rs"

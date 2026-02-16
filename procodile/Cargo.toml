@@ -1,0 +1,22 @@
+[package]
+name = "procodile"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = "2.0.18"
+widestring = "1.2.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = "0.18.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [ 
+    "Win32_System_WindowsProgramming", 
+    "Win32_System_SystemInformation",  
+    "Wdk_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_ProcessStatus"
+] }
