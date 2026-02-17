@@ -7,11 +7,20 @@ use crate::process::inner::{WindowsProcessHandle, WindowsProcessInner};
 use windows_sys::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemProcessInformation,
 };
-use windows_sys::Win32::Foundation::STATUS_SUCCESS;
+use windows_sys::Win32::Foundation::{CloseHandle, STATUS_SUCCESS};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 use windows_sys::Win32::System::{
     Threading::{OpenProcess, PROCESS_ALL_ACCESS, PROCESS_VM_READ, PROCESS_VM_WRITE},
     WindowsProgramming::SYSTEM_PROCESS_INFORMATION,
 };
+
+impl Drop for WindowsProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0.as_ptr());
+        }
+    }
+}
 
 impl WindowsProcessInner {
     pub fn open_process(&self, access: ProcessAccess) -> Result<WindowsProcessHandle> {
@@ -53,6 +62,15 @@ impl WindowsProcessInner {
         };
 
         WindowsProcessIterator::new(proc_buffer)
+    }
+
+    pub fn current_process_id() -> usize {
+        unsafe { GetCurrentProcessId() as usize }
+    }
+
+    pub fn open_current_process() -> WindowsProcessHandle {
+        let handle = NonNull::new(unsafe { GetCurrentProcess() }).unwrap();
+        WindowsProcessHandle(handle)
     }
 }
 

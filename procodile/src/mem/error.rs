@@ -19,4 +19,7 @@ pub enum MemoryError {
 
     #[error("Failed to get memory pages")]
     MemoryPageFail,
+
+    #[error("Failed to query memory page at {0:x}")]
+    MemoryPageQueryFail(usize),
 }

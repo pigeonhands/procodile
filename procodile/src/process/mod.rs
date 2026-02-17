@@ -1,9 +1,9 @@
 #[cfg(target_os = "windows")]
-pub mod inner {
+pub(crate) mod inner {
     pub mod windows;
-    pub(crate) use windows::*;
+    pub use windows::*;
 
-    pub(crate) use windows::WindowsProcessHandle as ProcessHandle;
+    pub use windows::WindowsProcessHandle as ProcessHandle;
     pub(crate) use windows::WindowsProcessInner as ProcessInner;
 }
 
@@ -15,7 +15,7 @@ use std::ffi::OsString;
 pub(crate) use inner::ProcessInner;
 use widestring::U16CStr;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct ProcessHandle(pub(crate) inner::ProcessHandle);
 
 pub struct Process {

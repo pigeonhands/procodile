@@ -2,6 +2,8 @@ pub mod basic;
 pub mod mem;
 pub mod process;
 
+pub use process::{Process, ProcessHandle};
+
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }

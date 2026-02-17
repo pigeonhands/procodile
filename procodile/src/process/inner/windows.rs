@@ -7,7 +7,7 @@ use windows_sys::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
 
 pub(crate) struct WindowsProcessInner(pub SYSTEM_PROCESS_INFORMATION);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct WindowsProcessHandle(pub(crate) NonNull<c_void>);
 
 impl WindowsProcessInner {

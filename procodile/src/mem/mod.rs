@@ -1,6 +1,8 @@
 pub mod inner {
     #[cfg(target_os = "windows")]
     mod windows;
+
+    pub(crate) use windows::WindowsMemoryPage as MemoryRegion;
 }
 
 pub mod error;
@@ -20,10 +22,44 @@ pub enum ProcessAccess {
 }
 
 #[derive(Debug)]
-pub struct MemoryRegion {
+pub struct ActiveMemoryRegion {
     pub base_address: usize,
     pub memory_size: usize,
-    pub protection_flags: u16,
+    pub flags: u16,
+}
+
+pub struct MemoryRegion(inner::MemoryRegion);
+
+impl MemoryRegion {
+    pub fn base_address(&self) -> *const c_void {
+        self.0.base_address()
+    }
+
+    pub fn region_size(&self) -> usize {
+        self.0.region_size()
+    }
+    pub fn raw_protection_flags(&self) -> usize {
+        self.0.raw_protection_flags() as usize
+    }
+
+    pub fn is_read(&self) -> bool {
+        self.0.is_read()
+    }
+    pub fn is_read_only(&self) -> bool {
+        self.0.is_read_only()
+    }
+
+    pub fn is_execute(&self) -> bool {
+        self.0.is_execute()
+    }
+
+    pub fn is_read_write(&self) -> bool {
+        self.0.is_read_write()
+    }
+
+    pub fn is_read_execute(&self) -> bool {
+        self.0.is_read_execute()
+    }
 }
 
 impl ProcessHandle {
@@ -57,7 +93,19 @@ impl ProcessHandle {
         }
     }
 
-    pub fn memory_regions(&self) -> Result<impl Iterator<Item = MemoryRegion>> {
-        self.0.get_memory_regions()
+    pub fn active_memory_regions(&self) -> Result<impl Iterator<Item = ActiveMemoryRegion>> {
+        self.0.get_active_memory_regions()
+    }
+
+    pub fn memory_regions(
+        &self,
+        start_address: *const c_void,
+        end_address: *const c_void,
+    ) -> Result<impl Iterator<Item = MemoryRegion>> {
+        Ok(self
+            .0
+            .get_memory_regions(start_address, end_address)?
+            .into_iter()
+            .map(MemoryRegion))
     }
 }
