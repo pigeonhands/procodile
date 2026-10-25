@@ -58,7 +58,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 pub use pattern::{ParsePatternError, Pattern, PatternOptions, find_pattern};
-pub use pointer::{PointerPath, PointerScanOptions, filter_pointers, scan_pointers};
+pub use pointer::{
+    MapModule, PointerMap, PointerMapOptions, PointerPath, PointerScanOptions, filter_pointers,
+    scan_pointers,
+};
 use value::Scalar;
 pub use value::{ParseValueError, Value, ValueType};
 
