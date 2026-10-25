@@ -7,6 +7,7 @@
 
 pub mod address;
 pub mod error;
+pub mod freeze;
 pub mod memory;
 pub mod module;
 pub mod os;
