@@ -30,6 +30,7 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("c", "process continue"),
     ("continue", "process continue"),
     ("ps", "process list"),
+    ("p", "struct read"),
     ("q", "quit"),
     ("exit", "quit"),
 ];
@@ -51,6 +52,9 @@ pub enum Command {
     /// Find pointer paths from static memory to an address, which survive restarts.
     #[command(subcommand)]
     Pointer(PointerCommand),
+    /// Define structures and view memory through them.
+    #[command(subcommand)]
+    Struct(StructCommand),
     /// The address table: saved addresses that can be watched, edited and frozen.
     #[command(subcommand)]
     Table(TableCommand),
@@ -326,6 +330,50 @@ pub enum PointerMapCommand {
     List,
     /// Delete a saved map.
     Remove { id: i64 },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StructCommand {
+    /// Define structures in C-like syntax, e.g.
+    /// `struct define 'struct Stats { i32 armor; i32 health; };'`.
+    Define {
+        /// Definitions; several words are joined with spaces.
+        #[arg(required = true, num_args = 1..)]
+        source: Vec<String>,
+    },
+    /// Load definitions from a file (adding to, or replacing, those with the same name).
+    Load { path: PathBuf },
+    /// Save all definitions to a file.
+    Save { path: PathBuf },
+    /// List defined structures.
+    List,
+    /// Show a structure's layout with offsets and sizes.
+    Show { name: String },
+    /// Read memory as a structure.
+    Read {
+        name: String,
+        /// Address expression.
+        address: String,
+        /// How many levels of pointers to follow.
+        #[arg(short, long, default_value_t = 1, value_parser = parse_usize)]
+        depth: usize,
+        /// Show field offsets.
+        #[arg(short, long)]
+        offsets: bool,
+    },
+    /// Guess the fields of unknown memory.
+    Dissect {
+        /// Address expression.
+        address: String,
+        /// Bytes to look at.
+        #[arg(short, long, default_value = "0x40", value_parser = parse_usize)]
+        size: usize,
+        /// Also define the guess as a structure with this name, to refine.
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Forget a structure.
+    Remove { name: String },
 }
 
 #[derive(Debug, Subcommand)]

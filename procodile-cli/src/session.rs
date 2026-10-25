@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use procodile::freeze::Freezer;
 use procodile::scan::{PointerPath, Scan, Value, ValueType};
+use procodile::structs::Structs;
 use procodile::{Access, Address, Process, ProcessHandle};
 
 use crate::expr::{self, Env};
@@ -31,6 +32,8 @@ pub struct Session {
     pub pointers: Option<PointerResults>,
     pub pointer_db: Option<PointerDb>,
     pub table: Table,
+    /// Structure definitions, independent of any process.
+    pub structs: Structs,
     /// The value type for scans and table entries when none is given.
     pub default_type: ValueType,
 }
@@ -43,6 +46,7 @@ impl Default for Session {
             pointers: None,
             pointer_db: None,
             table: Table::default(),
+            structs: Structs::new(),
             default_type: ValueType::I32,
         }
     }

@@ -5,6 +5,7 @@ mod expr;
 mod format;
 mod pointerdb;
 mod session;
+mod structview;
 mod table;
 mod tui;
 

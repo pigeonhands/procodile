@@ -29,6 +29,7 @@ pub fn run(session: &mut Session, command: Command) -> CmdResult {
         Command::Image(c) => image(session, c),
         Command::Scan(c) => scan(session, c),
         Command::Pointer(c) => pointer(session, c),
+        Command::Struct(c) => structs(session, c),
         Command::Table(c) => table(session, c),
         Command::Tui => crate::tui::run(session),
         // Handled by the REPL loop.
@@ -628,6 +629,157 @@ fn save_map(
     session
         .pointer_db()?
         .save_map(label, &t.name, t.pid, target, map)
+}
+
+fn structs(session: &mut Session, command: StructCommand) -> CmdResult {
+    let width = || {
+        session
+            .target
+            .as_ref()
+            .map_or(size_of::<usize>(), |t| t.pointer_width)
+    };
+    match command {
+        StructCommand::Define { source } => {
+            let names = session
+                .structs
+                .define(&source.join(" "))
+                .map_err(|e| e.to_string())?;
+            check_layouts(session, &names, width());
+            println!("defined {}", names.join(", "));
+        }
+        StructCommand::Load { path } => {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let names = session
+                .structs
+                .define(&text)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            check_layouts(session, &names, width());
+            println!("loaded {} structs from {}", names.len(), path.display());
+        }
+        StructCommand::Save { path } => {
+            std::fs::write(&path, session.structs.to_string())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            println!("saved structs to {}", path.display());
+        }
+        StructCommand::List => {
+            if session.structs.is_empty() {
+                println!("no structs defined; use `struct define` or `struct load`");
+            }
+            for def in session.structs.iter() {
+                match session.structs.layout(&def.name, width()) {
+                    Ok(l) => println!(
+                        "{:<24} size {:#6x}  {} fields",
+                        def.name,
+                        l.size,
+                        def.fields.len()
+                    ),
+                    Err(e) => println!("{:<24} error: {e}", def.name),
+                }
+            }
+        }
+        StructCommand::Show { name } => {
+            let layout = session
+                .structs
+                .layout(&name, width())
+                .map_err(|e| e.to_string())?;
+            for line in crate::structview::layout(&session.structs, &layout, width()) {
+                println!("{line}");
+            }
+        }
+        StructCommand::Read {
+            name,
+            address,
+            depth,
+            offsets,
+        } => {
+            for line in render_struct(session, &name, &address, depth, offsets)? {
+                println!("{line}");
+            }
+        }
+        StructCommand::Dissect {
+            address,
+            size,
+            name,
+        } => {
+            let target = session.target()?;
+            let address = session.eval(&address)?;
+            let guesses =
+                procodile::structs::dissect(&target.handle, address, size, target.pointer_width)
+                    .map_err(|e| e.to_string())?;
+            let modules = target.handle.modules().unwrap_or_default();
+            for g in &guesses {
+                use procodile::structs::GuessKind;
+                let value = match &g.kind {
+                    GuessKind::Pointer(a) => match describe(&modules, *a) {
+                        m if m.is_empty() => format!("{a:?}"),
+                        m => format!("{a:?} ({m})"),
+                    },
+                    GuessKind::String(s) => format!("{s:?}"),
+                    GuessKind::F32(v) => v.to_string(),
+                    GuessKind::F64(v) => v.to_string(),
+                    GuessKind::I32(v) => format!("{v} ({:#x})", *v as u32),
+                    GuessKind::Zero => "0".to_owned(),
+                };
+                println!("[{:#6x}] {:<10} {value}", g.offset, g.ty().to_string());
+            }
+            if let Some(name) = name {
+                let def = procodile::structs::guesses_to_struct(&name, &guesses);
+                println!("{def}");
+                session.structs.insert(def);
+                println!("defined {name}; refine it with `struct save` and `struct load`");
+            }
+        }
+        StructCommand::Remove { name } => {
+            if session.structs.remove(&name).is_none() {
+                return Err(format!("no struct named '{name}'"));
+            }
+            println!("removed {name}");
+        }
+    }
+    Ok(())
+}
+
+/// Reports structs that parse but cannot be laid out, e.g. because they embed one that is
+/// not defined yet. They are kept, since the missing one may be defined next.
+fn check_layouts(session: &Session, names: &[String], width: usize) {
+    for name in names {
+        if let Err(e) = session.structs.layout(name, width) {
+            println!("warning: {name}: {e}");
+        }
+    }
+}
+
+/// Reads struct `name` at an address expression and renders it.
+pub fn render_struct(
+    session: &Session,
+    name: &str,
+    address: &str,
+    depth: usize,
+    offsets: bool,
+) -> Result<Vec<String>, String> {
+    render_struct_at(session, name, session.eval(address)?, depth, offsets)
+}
+
+pub fn render_struct_at(
+    session: &Session,
+    name: &str,
+    address: Address,
+    depth: usize,
+    offsets: bool,
+) -> Result<Vec<String>, String> {
+    let target = session.target()?;
+    let node = session
+        .structs
+        .read(&target.handle, name, address, target.pointer_width, depth)
+        .map_err(|e| e.to_string())?;
+    let modules = target.handle.modules().unwrap_or_default();
+    let render = crate::structview::Render {
+        pointer_width: target.pointer_width,
+        modules: &modules,
+        offsets,
+    };
+    Ok(render.node(name, address, &node))
 }
 
 fn print_scan_summary(scan: &Scan, start: Instant) {
