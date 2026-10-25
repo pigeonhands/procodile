@@ -63,9 +63,11 @@ Commands follow lldb's `noun verb [options]` shape. Any unique prefix works (`me
 | `image list/lookup` | loaded modules |
 | `scan first/next/list/reset` | value scanning |
 | `pointer ...` | pointer scanning (below) |
+| `struct define/load/save/list/show/read/dissect/remove` | structures (below) |
 | `table add/list/write/freeze/unfreeze/remove/save/load` | the address table |
 
-Aliases: `x` (memory read), `attach`, `detach`, `c` (process continue), `ps`, `q`.
+Aliases: `x` (memory read), `p` (struct read), `attach`, `detach`, `c` (process continue),
+`ps`, `q`.
 
 Startup options, as in lldb: `-p <pid>` / `-n <name>` to attach, `-o <command>` to run a
 command first (repeatable), `-b` to exit afterwards.
@@ -82,6 +84,70 @@ Anywhere an address is expected:
 | `$N` | address table entry N |
 | `#N` | value scan result N |
 | `@N` | pointer scan result N |
+
+## Structures
+
+Define the layout of data in the target in a C-like syntax (so definitions can be pasted
+from headers or reverse engineering tools), then view memory through it.
+
+```c
+// game.h
+struct Stats {
+    i32 armor;
+    i32 mana;
+    i32 health;
+};
+
+struct Player {
+    u64 name_cap;
+    char *name;          // char * and char[N] are shown as strings
+    usize name_len;      // usize/size_t/uintptr_t follow the target's pointer size
+    Stats *stats;
+    u32 level;
+    0x40: f32 pos[3];    // an explicit offset; the gap is padding
+};
+```
+
+Fields use C's natural alignment, laid out for the target's pointer size. Types are the
+Rust names (`i8`..`u64`, `f32`, `f64`, `bool`, `char`, `usize`, `isize`), fixed-size C
+names (`int`, `unsigned short`, `uint32_t`, `float`, `double`, ...), pointers (including
+`void *`), arrays, and other structs. `long` is rejected because its size differs between
+Windows and Linux.
+
+```text
+(procodile) struct load game.h
+loaded 2 structs from game.h
+(procodile) struct show Player               # layout with offsets and sizes
+/* offset | size */  struct Player {
+/*    0x0 |  0x8 */      u64 name_cap;
+/*    0x8 |  0x8 */      char *name;
+...
+(procodile) p Player [target+0x5e078]        # struct read, following pointers 1 level
+(Player) 0x55f7353c4220 = {
+  name_cap = 4
+  name = 0x55f7353c6fc0 -> "hero"
+  name_len = 4
+  stats = 0x55f7353c6fe0 -> (Stats) {
+    armor = 5
+    mana = 50
+    health = 100
+  }
+  level = 1
+}
+```
+
+`struct read` takes `-d <depth>` (how many levels of pointers to follow; `0` shows
+addresses only) and `-o` (show field offsets). `struct define '<source>'` defines
+structures inline, and `struct save <file>` writes all definitions back out.
+
+For memory you don't have a definition for yet, `struct dissect <addr> [-s size]` guesses
+the fields: pointers into mapped memory, text, plausible floats, zeros and integers.
+`-n <name>` also defines the guess as a structure (with fields named after their offsets)
+to save, rename and refine.
+
+In the TUI, select a scan result or table entry and press `v` to view it as a structure
+instead of hex. The view updates live; `+`/`-` change the pointer depth and `[`/`]`
+scroll. Press `v` and submit an empty name to go back to hex.
 
 ## Pointer scanning
 
