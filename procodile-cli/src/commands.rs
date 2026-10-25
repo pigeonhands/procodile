@@ -26,6 +26,7 @@ pub fn run(session: &mut Session, command: Command) -> CmdResult {
         Command::Image(c) => image(session, c),
         Command::Scan(c) => scan(session, c),
         Command::Table(c) => table(session, c),
+        Command::Tui => crate::tui::run(session),
         // Handled by the REPL loop.
         Command::Quit => Ok(()),
     }
@@ -522,7 +523,11 @@ fn with_progress<T: Send>(
 }
 
 /// Parses a scan condition: a bare value means `eq`.
-fn parse_condition(words: &[String], ty: ValueType, first: bool) -> Result<Compare, String> {
+pub(crate) fn parse_condition(
+    words: &[String],
+    ty: ValueType,
+    first: bool,
+) -> Result<Compare, String> {
     let (op, args) = match words[0].parse::<f64>().is_ok() || words[0].starts_with("0x") {
         true => ("eq", words),
         false => (words[0].as_str(), &words[1..]),
@@ -582,7 +587,7 @@ fn parse_condition(words: &[String], ty: ValueType, first: bool) -> Result<Compa
 }
 
 /// Cheat Engine's "rounded" float matching: `1.5` matches anything that rounds to it.
-fn default_tolerance(ty: ValueType, condition: &[String]) -> f64 {
+pub(crate) fn default_tolerance(ty: ValueType, condition: &[String]) -> f64 {
     if !ty.is_float() {
         return 0.0;
     }
@@ -593,7 +598,7 @@ fn default_tolerance(ty: ValueType, condition: &[String]) -> f64 {
     0.5 * 10f64.powi(-(decimals as i32))
 }
 
-fn parse_value(ty: ValueType, s: &str) -> Result<Value, String> {
+pub(crate) fn parse_value(ty: ValueType, s: &str) -> Result<Value, String> {
     ty.parse(s).map_err(|e| e.to_string())
 }
 

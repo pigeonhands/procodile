@@ -51,6 +51,8 @@ pub enum Command {
     /// The address table: saved addresses that can be watched, edited and frozen.
     #[command(subcommand)]
     Table(TableCommand),
+    /// Open the full-screen interface (q returns here).
+    Tui,
     /// Exit procodile.
     Quit,
 }

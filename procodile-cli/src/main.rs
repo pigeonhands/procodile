@@ -5,6 +5,7 @@ mod expr;
 mod format;
 mod session;
 mod table;
+mod tui;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -106,7 +107,7 @@ fn main() -> rustyline::Result<()> {
 }
 
 /// Runs one command line. Returns false when the REPL should exit.
-fn execute(session: &mut Session, line: &str) -> bool {
+pub(crate) fn execute(session: &mut Session, line: &str) -> bool {
     let Some(mut words) = split_words(line) else {
         eprintln!("error: unbalanced quotes");
         return true;
