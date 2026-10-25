@@ -13,6 +13,7 @@ pub mod module;
 pub mod os;
 pub mod process;
 pub mod scan;
+pub mod structs;
 
 mod sys;
 

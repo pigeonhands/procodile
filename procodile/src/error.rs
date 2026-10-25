@@ -50,6 +50,9 @@ pub enum Error {
     #[error("invalid scan: {0}")]
     InvalidScan(String),
 
+    #[error("{0}")]
+    InvalidType(String),
+
     #[error("scan cancelled")]
     Cancelled,
 
