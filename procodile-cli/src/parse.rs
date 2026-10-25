@@ -1,14 +1,14 @@
-use std::ffi::c_void;
+use procodile::Address;
 
 /// Addresses are always interpreted as hex; an optional `0x`/`0X` prefix is stripped.
-pub fn parse_address(input: &str) -> Result<*const c_void, String> {
+pub fn parse_address(input: &str) -> Result<Address, String> {
     let trimmed = input.trim();
     let digits = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
     usize::from_str_radix(digits, 16)
-        .map(|addr| addr as *const c_void)
+        .map(Address::new)
         .map_err(|_| format!("invalid address '{input}' (expected hex, e.g. 0x7ff6a2b31000)"))
 }
 

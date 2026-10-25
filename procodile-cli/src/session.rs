@@ -1,4 +1,4 @@
-use procodile::process::{Process, ProcessHandle};
+use procodile::{Process, ProcessHandle};
 
 #[derive(Default)]
 pub struct Session {

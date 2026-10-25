@@ -17,7 +17,7 @@ pub enum Commands {
         sub: ProcessCommands,
     },
     Attach {
-        pid: usize,
+        pid: u32,
     },
     Detach,
     Memory {

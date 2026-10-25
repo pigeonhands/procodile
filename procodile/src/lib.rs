@@ -1,20 +1,24 @@
-pub mod basic;
-pub mod mem;
+//! Cross-platform primitives for inspecting and modifying the memory of other processes.
+//!
+//! The layout follows the standard library: the public modules (`process`, `memory`, ...)
+//! are thin, platform-independent facades over `sys`, which holds one backend per OS.
+//! Functionality that only exists on one platform is exposed through extension traits
+//! in [`os`].
+
+pub mod address;
+pub mod error;
+pub mod memory;
+pub mod os;
 pub mod process;
 
-pub use process::{Process, ProcessHandle};
+mod sys;
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub use address::Address;
+pub use error::{Error, Result};
+pub use memory::{Pod, Protection, Region, RegionKind};
+pub use process::{Access, Process, ProcessHandle};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+/// Access to the platform implementation behind a facade type, like std's `AsInner`.
+pub(crate) trait AsInner<Inner: ?Sized> {
+    fn as_inner(&self) -> &Inner;
 }

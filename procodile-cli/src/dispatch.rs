@@ -1,5 +1,4 @@
-use procodile::mem::ProcessAccess;
-use procodile::process::Process;
+use procodile::{Access, Address, Process};
 
 use crate::cli::{Commands, MemoryCommands, ProcessCommands};
 use crate::parse::{parse_address, parse_bytes};
@@ -17,25 +16,31 @@ pub fn dispatch(session: &mut Session, command: Commands) {
 fn dispatch_process(sub: ProcessCommands) {
     match sub {
         ProcessCommands::List => {
-            let mut processes: Vec<Process> = Process::iter_processes().collect();
-            processes.sort_by_key(|p| p.id());
+            let mut processes: Vec<Process> = match procodile::process::processes() {
+                Ok(p) => p.collect(),
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            processes.sort_by_key(|p| p.pid());
             println!("{:>8}  NAME", "PID");
             for p in processes {
-                println!("{:>8}  {}", p.id(), p.name().to_string_lossy());
+                println!("{:>8}  {}", p.pid(), p.name().to_string_lossy());
             }
         }
     }
 }
 
-fn dispatch_attach(session: &mut Session, pid: usize) {
-    let process = match Process::by_id(pid) {
+fn dispatch_attach(session: &mut Session, pid: u32) {
+    let process = match Process::by_pid(pid) {
         Ok(p) => p,
         Err(e) => {
             println!("Error: {e}");
             return;
         }
     };
-    let handle = match process.open_process(ProcessAccess::ReadWrite) {
+    let handle = match process.open(Access::ReadWrite) {
         Ok(h) => h,
         Err(e) => {
             println!("Error: failed to attach to pid {pid}: {e}");
@@ -45,7 +50,7 @@ fn dispatch_attach(session: &mut Session, pid: usize) {
     println!(
         "Attached to {} (pid {})",
         process.name().to_string_lossy(),
-        process.id()
+        process.pid()
     );
     session.attached = Some(AttachedProcess { process, handle });
 }
@@ -55,7 +60,7 @@ fn dispatch_detach(session: &mut Session) {
         Some(a) => println!(
             "Detached from {} (pid {})",
             a.process.name().to_string_lossy(),
-            a.process.id()
+            a.process.pid()
         ),
         None => println!("Error: no process attached"),
     }
@@ -77,7 +82,7 @@ fn dispatch_memory(session: &mut Session, sub: MemoryCommands) {
                 }
             };
             let mut buffer = vec![0u8; size];
-            match unsafe { attached.handle.read_memory_to_buffer(addr, &mut buffer) } {
+            match attached.handle.read_bytes(addr, &mut buffer) {
                 Ok(n) => print_hex_dump(addr, &buffer[..n]),
                 Err(e) => println!("Error: {e}"),
             }
@@ -97,7 +102,7 @@ fn dispatch_memory(session: &mut Session, sub: MemoryCommands) {
                     return;
                 }
             };
-            match unsafe { attached.handle.write_memory_to_buffer(addr, &bytes) } {
+            match attached.handle.write_bytes(addr, &bytes) {
                 Ok(n) => println!("Wrote {n} byte(s) to {addr:?}"),
                 Err(e) => println!("Error: {e}"),
             }
@@ -105,9 +110,9 @@ fn dispatch_memory(session: &mut Session, sub: MemoryCommands) {
     }
 }
 
-fn print_hex_dump(base: *const std::ffi::c_void, bytes: &[u8]) {
+fn print_hex_dump(base: Address, bytes: &[u8]) {
     for (i, chunk) in bytes.chunks(16).enumerate() {
-        let addr = base as usize + i * 16;
+        let addr = base.get() + i * 16;
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
