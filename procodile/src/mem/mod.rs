@@ -1,8 +1,13 @@
 pub mod inner {
     #[cfg(target_os = "windows")]
     mod windows;
-
+    #[cfg(target_os = "windows")]
     pub(crate) use windows::WindowsMemoryPage as MemoryRegion;
+
+    #[cfg(target_os = "linux")]
+    mod linux;
+    #[cfg(target_os = "linux")]
+    pub(crate) use linux::LinuxMemoryPage as MemoryRegion;
 }
 
 pub mod error;
@@ -26,6 +31,27 @@ pub struct ActiveMemoryRegion {
     pub base_address: usize,
     pub memory_size: usize,
     pub flags: u16,
+}
+
+impl ActiveMemoryRegion {
+    fn protection_flags(&self) -> u8 {
+        (self.flags & 0b_11111) as u8
+    }
+    pub fn can_read(&self) -> bool {
+        self.is_read_only() || self.is_read_execute() || self.is_read_write()
+    }
+    pub fn is_read_only(&self) -> bool {
+        self.protection_flags() == 1
+    }
+    pub fn is_execute(&self) -> bool {
+        self.protection_flags() == 2
+    }
+    pub fn is_read_execute(&self) -> bool {
+        self.protection_flags() == 3
+    }
+    pub fn is_read_write(&self) -> bool {
+        self.protection_flags() == 4
+    }
 }
 
 pub struct MemoryRegion(inner::MemoryRegion);
@@ -90,6 +116,35 @@ impl ProcessHandle {
                 return Err(error::MemoryError::MemoryReadFail(address));
             }
             Ok(buffer.assume_init())
+        }
+    }
+
+    pub unsafe fn write_memory_raw(
+        &self,
+        address: *const c_void,
+        buffer: *const c_void,
+        size: usize,
+    ) -> Result<usize> {
+        unsafe { self.0.write_memory(address, buffer, size) }
+    }
+    pub unsafe fn write_memory_to_buffer(
+        &self,
+        address: *const c_void,
+        buffer: &[u8],
+    ) -> Result<usize> {
+        unsafe { self.write_memory_raw(address, buffer.as_ptr() as *const _, buffer.len()) }
+    }
+    pub fn write_memory<T: Sized>(&self, address: *const c_void, value: &T) -> Result<()> {
+        unsafe {
+            let bytes_written = self.write_memory_raw(
+                address,
+                value as *const T as *const _,
+                core::mem::size_of::<T>(),
+            )?;
+            if bytes_written != core::mem::size_of::<T>() {
+                return Err(error::MemoryError::MemoryWriteFail(address));
+            }
+            Ok(())
         }
     }
 

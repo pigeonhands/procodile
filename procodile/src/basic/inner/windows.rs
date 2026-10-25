@@ -68,9 +68,9 @@ impl WindowsProcessInner {
         unsafe { GetCurrentProcessId() as usize }
     }
 
-    pub fn open_current_process() -> WindowsProcessHandle {
+    pub fn open_current_process() -> Result<WindowsProcessHandle> {
         let handle = NonNull::new(unsafe { GetCurrentProcess() }).unwrap();
-        WindowsProcessHandle(handle)
+        Ok(WindowsProcessHandle(handle))
     }
 }
 

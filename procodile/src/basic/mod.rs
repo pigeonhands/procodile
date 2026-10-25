@@ -11,6 +11,8 @@ pub use error::{ProcessBasicError, Result};
 pub mod inner {
     #[cfg(target_os = "windows")]
     pub(crate) mod windows;
+    #[cfg(target_os = "linux")]
+    pub(crate) mod linux;
 }
 
 impl Process {
@@ -20,10 +22,9 @@ impl Process {
 
     pub fn by_id(id: usize) -> Result<Self> {
         ProcessInner::iter_processes()
-            .filter(|p| p.0.UniqueProcessId as usize == id)
-            .next()
+            .find(|p| p.id() == id)
             .map(Process::from_inner)
-            .ok_or_else(|| ProcessBasicError::ProcessNotFound(id))
+            .ok_or(ProcessBasicError::ProcessNotFound(id))
     }
 
     pub fn by_name(name: &OsStr) -> impl Iterator<Item = Process> {
@@ -40,6 +41,6 @@ impl Process {
         Ok(ProcessInner::current_process_id())
     }
     pub fn open_current_process() -> Result<ProcessHandle> {
-        Ok(ProcessHandle(ProcessInner::open_current_process()))
+        ProcessInner::open_current_process().map(ProcessHandle)
     }
 }

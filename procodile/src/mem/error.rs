@@ -17,6 +17,9 @@ pub enum MemoryError {
     #[error("Failed to read memory at {0:?}")]
     MemoryReadFail(*const c_void),
 
+    #[error("Failed to write memory at {0:?}")]
+    MemoryWriteFail(*const c_void),
+
     #[error("Failed to get memory pages")]
     MemoryPageFail,
 

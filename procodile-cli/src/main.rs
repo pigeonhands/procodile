@@ -1,33 +1,18 @@
+mod cli;
+mod dispatch;
+mod parse;
+mod session;
+
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 
 use clap::Parser;
 
-#[derive(Parser, Debug)]
-#[command(
-    multicall=true,
-    infer_subcommands = true // This is the magic line
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum Commands {
-    Memory {
-        #[command(subcommand)]
-        sub: MemoryCommands,
-    },
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum MemoryCommands {
-    Read { address: String },
-    Write { address: String },
-}
+use cli::Cli;
+use session::Session;
 
 fn main() -> Result<()> {
+    let mut session = Session::new();
     let mut rl = DefaultEditor::new()?;
 
     loop {
@@ -50,9 +35,7 @@ fn main() -> Result<()> {
                 // 2. Parse with Clap
                 // we use try_parse_from so it doesn't crash the whole app on error
                 match Cli::try_parse_from(words) {
-                    Ok(cli) => {
-                        println!("{:?}", cli);
-                    }
+                    Ok(cli) => dispatch::dispatch(&mut session, cli.command),
                     Err(e) => {
                         // This prints help or error messages to the user
                         e.print()?;

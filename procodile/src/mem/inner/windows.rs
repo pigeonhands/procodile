@@ -9,7 +9,7 @@ use crate::{
 };
 
 use windows_sys::Win32::System::{
-    Diagnostics::Debug::ReadProcessMemory,
+    Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory},
     Memory::{
         MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
         PAGE_READWRITE, VirtualQueryEx,
@@ -73,6 +73,23 @@ impl WindowsProcessHandle {
             Err(MemoryError::MemoryReadFail(address))
         } else {
             Ok(bytes_read)
+        }
+    }
+
+    pub unsafe fn write_memory(
+        &self,
+        address: *const c_void,
+        buffer: *const c_void,
+        size: usize,
+    ) -> Result<usize> {
+        let mut bytes_written = 0;
+        let result = unsafe {
+            WriteProcessMemory(self.0.as_ptr(), address, buffer, size, &mut bytes_written)
+        };
+        if result == 0 {
+            Err(MemoryError::MemoryWriteFail(address))
+        } else {
+            Ok(bytes_written)
         }
     }
 
@@ -220,27 +237,6 @@ impl<'a> Iterator for WindowsVirtualQueryPageIterator<'a> {
             break;
         }
         page
-    }
-}
-
-impl ActiveMemoryRegion {
-    fn protection_flags(&self) -> u8 {
-        (self.flags & 0b_11111) as u8
-    }
-    pub fn can_read(&self) -> bool {
-        self.is_read_only() || self.is_read_execute() || self.is_read_write()
-    }
-    pub fn is_read_only(&self) -> bool {
-        self.protection_flags() == 1
-    }
-    pub fn is_execute(&self) -> bool {
-        self.protection_flags() == 2
-    }
-    pub fn is_read_execute(&self) -> bool {
-        self.protection_flags() == 3
-    }
-    pub fn is_read_write(&self) -> bool {
-        self.protection_flags() == 4
     }
 }
 
