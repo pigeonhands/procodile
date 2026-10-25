@@ -18,7 +18,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::commands::{default_tolerance, describe, parse_condition, parse_value, table_line};
+use crate::commands::{
+    default_tolerance, describe, parse_condition, parse_value, render_struct_at, table_line,
+};
 use crate::format::{self, Format};
 use crate::session::Session;
 use crate::table::Entry;
@@ -53,6 +55,7 @@ enum InputKind {
     NextScan,
     WriteEntry(usize),
     Describe(usize),
+    StructView,
     Command,
 }
 
@@ -63,6 +66,7 @@ impl InputKind {
             InputKind::NextScan => "next scan (93 | changed | unchanged | inc | dec | dec-by 7): ",
             InputKind::WriteEntry(_) => "new value: ",
             InputKind::Describe(_) => "description: ",
+            InputKind::StructView => "view selection as struct (empty for hex): ",
             InputKind::Command => ":",
         }
     }
@@ -127,6 +131,10 @@ struct App<'s> {
     modules: Vec<Module>,
     modules_loaded: Option<Instant>,
     pending_command: Option<String>,
+    /// Show the selection as this struct instead of hex.
+    struct_view: Option<String>,
+    struct_depth: usize,
+    struct_scroll: usize,
     quit: bool,
 }
 
@@ -150,6 +158,9 @@ impl<'s> App<'s> {
             modules: Vec::new(),
             modules_loaded: None,
             pending_command: None,
+            struct_view: None,
+            struct_depth: 1,
+            struct_scroll: 0,
             quit: false,
         }
     }
@@ -373,10 +384,26 @@ impl<'s> App<'s> {
             KeyCode::Char(':') => self.mode = input(InputKind::Command),
             KeyCode::Char('?') => {
                 self.status = "f first scan  n next scan  r reset  t type  a add to table  \
-                    space freeze  e edit  D describe  d delete  p process  : command"
+                    space freeze  e edit  D describe  d delete  v struct view  p process  \
+                    : command"
                     .into()
             }
             KeyCode::Char('f') => self.mode = input(InputKind::FirstScan),
+            KeyCode::Char('v') => {
+                if self.session.structs.is_empty() {
+                    self.status = "no structs defined; use :struct define or :struct load".into();
+                } else {
+                    self.mode = input(InputKind::StructView);
+                }
+            }
+            KeyCode::Char('+') if self.struct_view.is_some() => self.struct_depth += 1,
+            KeyCode::Char('-') if self.struct_view.is_some() => {
+                self.struct_depth = self.struct_depth.saturating_sub(1)
+            }
+            KeyCode::Char(']') if self.struct_view.is_some() => self.struct_scroll += 1,
+            KeyCode::Char('[') if self.struct_view.is_some() => {
+                self.struct_scroll = self.struct_scroll.saturating_sub(1)
+            }
             KeyCode::Char('n') if self.session.scan.is_some() => {
                 self.mode = input(InputKind::NextScan)
             }
@@ -422,6 +449,23 @@ impl<'s> App<'s> {
             InputKind::Command => {
                 if !buffer.trim().is_empty() {
                     self.pending_command = Some(buffer);
+                }
+            }
+            InputKind::StructView => {
+                let name = buffer.trim();
+                self.struct_scroll = 0;
+                if name.is_empty() {
+                    self.struct_view = None;
+                } else if self.session.structs.get(name).is_some() {
+                    self.struct_view = Some(name.to_owned());
+                } else {
+                    let names: Vec<&str> = self
+                        .session
+                        .structs
+                        .iter()
+                        .map(|d| d.name.as_str())
+                        .collect();
+                    self.status = format!("no struct '{name}' (have: {})", names.join(", "));
                 }
             }
             InputKind::Describe(i) => {
@@ -520,7 +564,7 @@ impl<'s> App<'s> {
         let [top, body, memory, bottom] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(6),
-            Constraint::Length(10),
+            Constraint::Length(if self.struct_view.is_some() { 18 } else { 10 }),
             Constraint::Length(1),
         ])
         .areas(f.area());
@@ -672,6 +716,28 @@ impl<'s> App<'s> {
             f.render_widget(Block::bordered().title(" Memory ").dim(), area);
             return;
         };
+        if let Some(name) = &self.struct_view {
+            let lines = match render_struct_at(self.session, name, address, self.struct_depth, true)
+            {
+                Ok(lines) => lines,
+                Err(e) => vec![format!("error: {e}")],
+            };
+            let title = format!(
+                " {name} at {address:?} {}  depth {} (+/-)  scroll [ ]  v: change ",
+                describe(&self.modules, address),
+                self.struct_depth
+            );
+            let lines: Vec<Line> = lines
+                .into_iter()
+                .skip(self.struct_scroll)
+                .map(Line::from)
+                .collect();
+            f.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title(title)),
+                area,
+            );
+            return;
+        }
         let base = address.align_down(16);
         let rows = area.height.saturating_sub(2) as usize;
         let mut buf = vec![0; rows * 16];
