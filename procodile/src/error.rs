@@ -47,6 +47,12 @@ pub enum Error {
         source: io::Error,
     },
 
+    #[error("invalid scan: {0}")]
+    InvalidScan(String),
+
+    #[error("scan cancelled")]
+    Cancelled,
+
     #[error("{0} is not supported on this platform")]
     Unsupported(&'static str),
 }
