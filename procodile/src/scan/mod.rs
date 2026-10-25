@@ -49,12 +49,14 @@ macro_rules! with_scalar {
     };
 }
 
+mod pattern;
 mod value;
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
+pub use pattern::{ParsePatternError, Pattern, PatternOptions, find_pattern};
 use value::Scalar;
 pub use value::{ParseValueError, Value, ValueType};
 
