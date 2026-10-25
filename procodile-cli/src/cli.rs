@@ -255,9 +255,15 @@ pub enum ScanCommand {
 #[derive(Debug, Subcommand)]
 pub enum PointerCommand {
     /// Find paths from module statics to an address; refer to them as @N.
+    ///
+    /// With a pointer database open, the pointer map built for the scan is saved too.
     Scan {
-        /// Address expression, e.g. `#0` or `$1`.
-        address: String,
+        /// Address expression, e.g. `#0` or `$1`. Defaults to the map's target with --map.
+        #[arg(required_unless_present = "map")]
+        address: Option<String>,
+        /// Scan a saved pointer map instead of the attached process.
+        #[arg(short, long)]
+        map: Option<i64>,
         /// Maximum number of dereferences.
         #[arg(short, long, default_value_t = 4, value_parser = parse_usize)]
         depth: usize,
@@ -268,7 +274,7 @@ pub enum PointerCommand {
         #[arg(short, long, default_value_t = 10_000, value_parser = parse_usize)]
         count: usize,
         /// Also look for pointers stored in read-only memory.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "map")]
         read_only: bool,
     },
     /// Show paths with the address each one resolves to now.
@@ -278,15 +284,48 @@ pub enum PointerCommand {
         #[arg(short, long, default_value_t = 0, value_parser = parse_usize)]
         start: usize,
     },
-    /// Keep only the paths that resolve to an address, e.g. after restarting the target
-    /// and finding the value again.
+    /// Keep only the paths that resolve to an address in the attached process, e.g. after
+    /// restarting the target and finding the value again.
     Filter { address: String },
-    /// Save the paths to a file, one per line.
+    /// Keep only the paths that resolve to each saved map's target within that map.
+    Intersect {
+        #[arg(required = true)]
+        maps: Vec<i64>,
+    },
+    /// Manage saved pointer maps (needs `pointer open`).
+    #[command(subcommand)]
+    Map(PointerMapCommand),
+    /// Open or create a pointer database, which keeps maps and results across sessions.
+    Open { path: PathBuf },
+    /// Close the pointer database. Results stay loaded.
+    Close,
+    /// Save the paths to a text file, one per line.
     Save { path: PathBuf },
     /// Load paths saved with `pointer save`.
     Load { path: PathBuf },
     /// Discard the pointer scan results.
     Reset,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PointerMapCommand {
+    /// Snapshot every pointer in the attached process, recording where the value is now.
+    ///
+    /// Take one per run of the target, finding the value again each time, then use
+    /// `pointer intersect` to keep only the paths that work in every run.
+    Save {
+        /// Address of the value in this run, e.g. `#0`.
+        address: String,
+        #[arg(short, long)]
+        label: Option<String>,
+        /// Also record pointers stored in read-only memory.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// List saved maps.
+    List,
+    /// Delete a saved map.
+    Remove { id: i64 },
 }
 
 #[derive(Debug, Subcommand)]

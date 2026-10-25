@@ -3,6 +3,7 @@ mod commands;
 mod completion;
 mod expr;
 mod format;
+mod pointerdb;
 mod session;
 mod table;
 mod tui;

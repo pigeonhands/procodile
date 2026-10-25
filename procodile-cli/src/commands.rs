@@ -5,13 +5,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use procodile::scan::{
-    Compare, Pattern, PatternOptions, PointerPath, PointerScanOptions, Progress, Scan, ScanOptions,
-    Value, ValueType, filter_pointers, find_pattern, scan_pointers,
+    Compare, Pattern, PatternOptions, PointerMap, PointerMapOptions, PointerPath,
+    PointerScanOptions, Progress, Scan, ScanOptions, Value, ValueType, filter_pointers,
+    find_pattern,
 };
 use procodile::{Address, Module, Protection, Region};
 
 use crate::cli::*;
 use crate::format::{self, Format};
+use crate::pointerdb::PointerDb;
 use crate::session::{PointerResults, Session};
 use crate::table::Entry;
 
@@ -382,24 +384,38 @@ fn pointer(session: &mut Session, command: PointerCommand) -> CmdResult {
     match command {
         PointerCommand::Scan {
             address,
+            map,
             depth,
             max_offset,
             count,
             read_only,
         } => {
-            let target = session.eval(&address)?;
             let options = PointerScanOptions {
                 max_depth: depth,
                 max_offset,
                 max_results: count,
-                writable_only: !read_only,
-                ..Default::default()
             };
-            let handle = session.handle()?;
             let start = Instant::now();
-            let paths = with_progress("building pointer map", |progress| {
-                scan_pointers(handle, target, &options, Some(progress))
-            })?;
+            let (target, paths) = match map {
+                Some(id) => {
+                    let (info, map) = session.pointer_db()?.load_map(id)?;
+                    let target = match address {
+                        Some(a) => session.eval(&a)?,
+                        None => info.target,
+                    };
+                    println!("scanning map {id} ({} pointers)", map.len());
+                    (target, map.scan(target, &options))
+                }
+                None => {
+                    let target = session.eval(address.as_deref().unwrap())?;
+                    let map = build_map(session, read_only)?;
+                    if session.pointer_db.is_some() {
+                        let id = save_map(session, target, &map, "scan")?;
+                        println!("saved pointer map {id}");
+                    }
+                    (target, map.scan(target, &options))
+                }
+            };
             let elapsed = start.elapsed().as_secs_f64();
             println!(
                 "{} pointer paths to {target:?} ({elapsed:.2}s); see `pointer list`",
@@ -408,23 +424,27 @@ fn pointer(session: &mut Session, command: PointerCommand) -> CmdResult {
             if paths.len() == count {
                 println!("(stopped after {count}; use --count for more)");
             }
-            session.pointers = Some(PointerResults { target, paths });
+            session.set_pointers(Some(PointerResults { target, paths }))?;
         }
         PointerCommand::List { count, start } => {
             let results = session
                 .pointers
                 .as_ref()
                 .ok_or("no pointer scan results; use `pointer scan`")?;
-            let target = session.target()?;
-            let modules = target.handle.modules().map_err(|e| e.to_string())?;
-            println!("paths to {:?}:", results.target);
+            let live = session
+                .target
+                .as_ref()
+                .and_then(|t| Some((t, t.handle.modules().ok()?)));
+            println!("{} paths to {:?}:", results.paths.len(), results.target);
             for (i, path) in results.paths.iter().enumerate().skip(start).take(count) {
-                let now = match path.resolve(&target.handle, &modules, target.pointer_width) {
-                    Ok(a) if a == results.target => format!("{a:?}"),
-                    Ok(a) => format!("{a:?} (moved)"),
-                    Err(_) => "??".to_owned(),
+                let now = match &live {
+                    Some((t, modules)) => match path.resolve(&t.handle, modules, t.pointer_width) {
+                        Ok(a) => format!("  -> {a:?}"),
+                        Err(_) => "  -> ??".to_owned(),
+                    },
+                    None => String::new(),
                 };
-                println!("@{i:<5} {path}  -> {now}");
+                println!("@{i:<5} {path}{now}");
             }
             let shown = results.paths.len().saturating_sub(start).min(count);
             if start + shown < results.paths.len() {
@@ -438,18 +458,79 @@ fn pointer(session: &mut Session, command: PointerCommand) -> CmdResult {
             let target = session.eval(&address)?;
             let results = session
                 .pointers
-                .as_mut()
+                .take()
                 .ok_or("no pointer scan results; use `pointer scan` or `pointer load`")?;
-            let handle = &session.target.as_ref().ok_or("no process attached")?.handle;
-            let before = results.paths.len();
-            results.paths =
-                filter_pointers(handle, &results.paths, target).map_err(|e| e.to_string())?;
-            results.target = target;
+            let filtered = session.handle().and_then(|h| {
+                filter_pointers(h, &results.paths, target).map_err(|e| e.to_string())
+            });
+            let paths = match filtered {
+                Ok(paths) => paths,
+                Err(e) => {
+                    session.pointers = Some(results);
+                    return Err(e);
+                }
+            };
             println!(
-                "{} of {before} paths resolve to {target:?}",
+                "{} of {} paths resolve to {target:?}",
+                paths.len(),
                 results.paths.len()
             );
+            session.set_pointers(Some(PointerResults { target, paths }))?;
         }
+        PointerCommand::Intersect { maps } => {
+            let mut results = session
+                .pointers
+                .take()
+                .ok_or("no pointer scan results; use `pointer scan` first")?;
+            let mut outcome = Ok(());
+            for id in maps {
+                match session.pointer_db().and_then(|db| db.load_map(id)) {
+                    Ok((info, map)) => {
+                        let before = results.paths.len();
+                        results.paths = map.filter(&results.paths, info.target);
+                        println!(
+                            "map {id} ({}): {} of {before} paths resolve to {:?}",
+                            info.label,
+                            results.paths.len(),
+                            info.target
+                        );
+                    }
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+            }
+            session.set_pointers(Some(results))?;
+            outcome?;
+        }
+        PointerCommand::Map(command) => pointer_map(session, command)?,
+        PointerCommand::Open { path } => {
+            let db = PointerDb::open(&path)?;
+            let stored = db.load_paths()?;
+            let maps = db.maps()?.len();
+            session.pointer_db = Some(db);
+            match stored {
+                Some((target, paths)) => {
+                    println!(
+                        "opened {}: {maps} maps, {} paths to {target:?}",
+                        path.display(),
+                        paths.len()
+                    );
+                    session.pointers = Some(PointerResults { target, paths });
+                }
+                None => {
+                    println!("opened {}: {maps} maps", path.display());
+                    // Keep current results, and store them in the new database.
+                    let current = session.pointers.take();
+                    session.set_pointers(current)?;
+                }
+            }
+        }
+        PointerCommand::Close => match session.pointer_db.take() {
+            Some(db) => println!("closed {}", db.path().display()),
+            None => return Err("no pointer database open".into()),
+        },
         PointerCommand::Save { path } => {
             let results = session
                 .pointers
@@ -473,17 +554,80 @@ fn pointer(session: &mut Session, command: PointerCommand) -> CmdResult {
                 .collect::<Result<Vec<_>, _>>()?;
             println!("loaded {} paths from {}", paths.len(), path.display());
             println!("note: use `pointer filter <address>` to keep those that still match");
-            session.pointers = Some(PointerResults {
+            session.set_pointers(Some(PointerResults {
                 target: Address::NULL,
                 paths,
-            });
+            }))?;
         }
         PointerCommand::Reset => {
-            session.pointers = None;
+            session.set_pointers(None)?;
             println!("pointer scan results discarded");
         }
     }
     Ok(())
+}
+
+fn pointer_map(session: &mut Session, command: PointerMapCommand) -> CmdResult {
+    match command {
+        PointerMapCommand::Save {
+            address,
+            label,
+            read_only,
+        } => {
+            session.pointer_db()?;
+            let target = session.eval(&address)?;
+            let map = build_map(session, read_only)?;
+            let label =
+                label.unwrap_or_else(|| format!("pid {}", session.target.as_ref().unwrap().pid));
+            let id = save_map(session, target, &map, &label)?;
+            println!(
+                "saved pointer map {id}: {} pointers, value at {target:?}",
+                map.len()
+            );
+        }
+        PointerMapCommand::List => {
+            let maps = session.pointer_db()?.maps()?;
+            if maps.is_empty() {
+                println!("no saved maps; use `pointer map save <address>`");
+            }
+            for m in maps {
+                println!(
+                    "{:<4} {:<16} {} pid {:<7} value at {:<18?} {:>10} pointers  {}",
+                    m.id, m.label, m.process, m.pid, m.target, m.pointers, m.created
+                );
+            }
+        }
+        PointerMapCommand::Remove { id } => {
+            if !session.pointer_db()?.remove_map(id)? {
+                return Err(format!("no pointer map {id}"));
+            }
+            println!("removed pointer map {id}");
+        }
+    }
+    Ok(())
+}
+
+fn build_map(session: &Session, read_only: bool) -> Result<PointerMap, String> {
+    let handle = session.handle()?;
+    let options = PointerMapOptions {
+        writable_only: !read_only,
+        ..Default::default()
+    };
+    with_progress("building pointer map", |progress| {
+        PointerMap::build(handle, &options, Some(progress))
+    })
+}
+
+fn save_map(
+    session: &Session,
+    target: Address,
+    map: &PointerMap,
+    label: &str,
+) -> Result<i64, String> {
+    let t = session.target()?;
+    session
+        .pointer_db()?
+        .save_map(label, &t.name, t.pid, target, map)
 }
 
 fn print_scan_summary(scan: &Scan, start: Instant) {

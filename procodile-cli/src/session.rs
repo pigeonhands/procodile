@@ -7,6 +7,7 @@ use procodile::scan::{PointerPath, Scan, Value, ValueType};
 use procodile::{Access, Address, Process, ProcessHandle};
 
 use crate::expr::{self, Env};
+use crate::pointerdb::PointerDb;
 use crate::table::Table;
 
 pub struct Target {
@@ -28,6 +29,7 @@ pub struct Session {
     pub scan: Option<Scan>,
     /// Kept across detach: pointer paths are meant to survive restarts of the target.
     pub pointers: Option<PointerResults>,
+    pub pointer_db: Option<PointerDb>,
     pub table: Table,
     /// The value type for scans and table entries when none is given.
     pub default_type: ValueType,
@@ -39,6 +41,7 @@ impl Default for Session {
             target: None,
             scan: None,
             pointers: None,
+            pointer_db: None,
             table: Table::default(),
             default_type: ValueType::I32,
         }
@@ -156,6 +159,24 @@ impl Session {
             target.freezer.unfreeze(id);
         }
         Ok(true)
+    }
+
+    /// Replaces the pointer results, saving them to the pointer database if one is open.
+    pub fn set_pointers(&mut self, results: Option<PointerResults>) -> Result<(), String> {
+        if let Some(db) = &mut self.pointer_db {
+            match &results {
+                Some(r) => db.save_paths(r.target, &r.paths)?,
+                None => db.clear_paths()?,
+            }
+        }
+        self.pointers = results;
+        Ok(())
+    }
+
+    pub fn pointer_db(&self) -> Result<&PointerDb, String> {
+        self.pointer_db
+            .as_ref()
+            .ok_or_else(|| "no pointer database open; use `pointer open <file>`".to_owned())
     }
 
     pub fn pointer(&self, index: usize) -> Result<&PointerPath, String> {
