@@ -7,6 +7,12 @@ use std::hint::black_box;
 use std::io::BufRead;
 
 fn main() {
+    // With Yama's ptrace_scope = 1, only ancestors may attach; let any process attach.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY);
+    }
+
     let mut health: Box<i32> = Box::new(100);
     println!(
         "pid {}, health at {:p}",
