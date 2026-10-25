@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use procodile::freeze::Freezer;
-use procodile::scan::{Scan, Value, ValueType};
+use procodile::scan::{PointerPath, Scan, Value, ValueType};
 use procodile::{Access, Address, Process, ProcessHandle};
 
 use crate::expr::{self, Env};
@@ -17,9 +17,17 @@ pub struct Target {
     pub pointer_width: usize,
 }
 
+pub struct PointerResults {
+    /// The address the paths were found for, or last filtered against.
+    pub target: Address,
+    pub paths: Vec<PointerPath>,
+}
+
 pub struct Session {
     pub target: Option<Target>,
     pub scan: Option<Scan>,
+    /// Kept across detach: pointer paths are meant to survive restarts of the target.
+    pub pointers: Option<PointerResults>,
     pub table: Table,
     /// The value type for scans and table entries when none is given.
     pub default_type: ValueType,
@@ -30,6 +38,7 @@ impl Default for Session {
         Self {
             target: None,
             scan: None,
+            pointers: None,
             table: Table::default(),
             default_type: ValueType::I32,
         }
@@ -149,6 +158,17 @@ impl Session {
         Ok(true)
     }
 
+    pub fn pointer(&self, index: usize) -> Result<&PointerPath, String> {
+        let results = self
+            .pointers
+            .as_ref()
+            .ok_or("no pointer scan results; use `pointer scan`")?;
+        results
+            .paths
+            .get(index)
+            .ok_or_else(|| format!("no pointer path @{index} ({} paths)", results.paths.len()))
+    }
+
     pub fn remove_entry(&mut self, index: usize) -> Result<(), String> {
         self.unfreeze(index)?;
         self.table.entries.remove(index);
@@ -185,6 +205,14 @@ impl Env for Session {
         parsed.eval(self)
     }
 
+    fn pointer_path(&self, index: usize) -> Result<Address, String> {
+        let path = self.pointer(index)?;
+        let target = self.target()?;
+        let modules = target.handle.modules().map_err(|e| e.to_string())?;
+        path.resolve(&target.handle, &modules, target.pointer_width)
+            .map_err(|e| e.to_string())
+    }
+
     fn scan_result(&self, index: usize) -> Result<Address, String> {
         let scan = self
             .scan
@@ -203,7 +231,7 @@ fn references_table(e: &expr::Expr) -> bool {
         Table(_) => true,
         Deref(a) => references_table(a),
         Add(a, b) | Sub(a, b) => references_table(a) || references_table(b),
-        Number(_) | Module(_) | ScanResult(_) => false,
+        Number(_) | Module(_) | ScanResult(_) | PointerPath(_) => false,
     }
 }
 

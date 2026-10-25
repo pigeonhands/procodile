@@ -1,14 +1,14 @@
-//! Address expressions, e.g. `0x7ffd1000`, `game.exe+0x1c`, `[[$0]+8]-4`, `#3`.
+//! Address expressions, e.g. `0x7ffd1000`, `game.exe+0x1c`, `[[$0]+8]-4`, `#3`, `@0`.
 //!
 //! ```text
 //! expr := term (('+' | '-') term)*
-//! term := number | module | '[' expr ']' | '(' expr ')' | '$' index | '#' index
+//! term := number | module | '[' expr ']' | '(' expr ')' | '$' index | '#' index | '@' index
 //! ```
 //!
 //! Numbers are decimal unless prefixed with `0x`, as in lldb. A module is its file name
 //! (`libc.so.6`), quoted if it contains other characters (`"ld-linux-x86-64.so.2"`).
-//! `[x]` reads the pointer at `x`, `$N` is address table entry N, and `#N` is scan
-//! result N.
+//! `[x]` reads the pointer at `x`, `$N` is address table entry N, `#N` is scan result N,
+//! and `@N` is pointer scan result N.
 
 use procodile::Address;
 
@@ -21,6 +21,7 @@ pub enum Expr {
     Sub(Box<Expr>, Box<Expr>),
     Table(usize),
     ScanResult(usize),
+    PointerPath(usize),
 }
 
 /// What an expression can refer to.
@@ -29,6 +30,7 @@ pub trait Env {
     fn read_pointer(&self, address: Address) -> Result<Address, String>;
     fn table_entry(&self, index: usize) -> Result<Address, String>;
     fn scan_result(&self, index: usize) -> Result<Address, String>;
+    fn pointer_path(&self, index: usize) -> Result<Address, String>;
 }
 
 impl Expr {
@@ -41,6 +43,7 @@ impl Expr {
             Expr::Sub(a, b) => Address::new(a.eval(env)?.get().wrapping_sub(b.eval(env)?.get())),
             Expr::Table(i) => env.table_entry(*i)?,
             Expr::ScanResult(i) => env.scan_result(*i)?,
+            Expr::PointerPath(i) => env.pointer_path(*i)?,
         })
     }
 }
@@ -154,6 +157,9 @@ impl Parser<'_> {
         if self.eat('#') {
             return self.index().map(Expr::ScanResult);
         }
+        if self.eat('@') {
+            return self.index().map(Expr::PointerPath);
+        }
         if self.eat('"') {
             let name = self.take_while(|c| c != '"').to_owned();
             if !self.eat('"') {
@@ -207,6 +213,9 @@ mod tests {
         fn scan_result(&self, index: usize) -> Result<Address, String> {
             Ok(Address::new(0x100 * index))
         }
+        fn pointer_path(&self, index: usize) -> Result<Address, String> {
+            Ok(Address::new(0x1000 * index))
+        }
     }
 
     fn eval(s: &str) -> usize {
@@ -229,6 +238,7 @@ mod tests {
         assert_eq!(eval("[game.exe+8]+4"), 0x401008 + 4);
         assert_eq!(eval("[[0x10]]"), 0x2010);
         assert_eq!(eval("$2+(#1-0x10)"), 0x20 + 0x100 - 0x10);
+        assert_eq!(eval("@3+1"), 0x3001);
         assert!(parse("[0x10").is_err());
         assert!(parse("0x10 +").is_err());
         assert!(parse("nope").unwrap().eval(&TestEnv).is_err());

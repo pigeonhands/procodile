@@ -48,6 +48,9 @@ pub enum Command {
     /// Find values by scanning, then narrowing down the results.
     #[command(subcommand)]
     Scan(ScanCommand),
+    /// Find pointer paths from static memory to an address, which survive restarts.
+    #[command(subcommand)]
+    Pointer(PointerCommand),
     /// The address table: saved addresses that can be watched, edited and frozen.
     #[command(subcommand)]
     Table(TableCommand),
@@ -250,8 +253,45 @@ pub enum ScanCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum PointerCommand {
+    /// Find paths from module statics to an address; refer to them as @N.
+    Scan {
+        /// Address expression, e.g. `#0` or `$1`.
+        address: String,
+        /// Maximum number of dereferences.
+        #[arg(short, long, default_value_t = 4, value_parser = parse_usize)]
+        depth: usize,
+        /// Maximum offset after each dereference.
+        #[arg(short = 'o', long, default_value = "0x1000", value_parser = parse_usize)]
+        max_offset: usize,
+        /// Stop after this many paths.
+        #[arg(short, long, default_value_t = 10_000, value_parser = parse_usize)]
+        count: usize,
+        /// Also look for pointers stored in read-only memory.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Show paths with the address each one resolves to now.
+    List {
+        #[arg(short, long, default_value_t = 20, value_parser = parse_usize)]
+        count: usize,
+        #[arg(short, long, default_value_t = 0, value_parser = parse_usize)]
+        start: usize,
+    },
+    /// Keep only the paths that resolve to an address, e.g. after restarting the target
+    /// and finding the value again.
+    Filter { address: String },
+    /// Save the paths to a file, one per line.
+    Save { path: PathBuf },
+    /// Load paths saved with `pointer save`.
+    Load { path: PathBuf },
+    /// Discard the pointer scan results.
+    Reset,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum TableCommand {
-    /// Add an address (e.g. `#0`, `game.exe+0x1c`, `[[base]+8]`); refer to it as $N.
+    /// Add an address (e.g. `#0`, `@2`, `game.exe+0x1c`, `[[base]+8]`); refer to it as $N.
     Add {
         address: String,
         #[arg(short, long)]

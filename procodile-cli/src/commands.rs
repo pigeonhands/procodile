@@ -5,13 +5,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use procodile::scan::{
-    Compare, Pattern, PatternOptions, Progress, Scan, ScanOptions, Value, ValueType, find_pattern,
+    Compare, Pattern, PatternOptions, PointerPath, PointerScanOptions, Progress, Scan, ScanOptions,
+    Value, ValueType, filter_pointers, find_pattern, scan_pointers,
 };
 use procodile::{Address, Module, Protection, Region};
 
 use crate::cli::*;
 use crate::format::{self, Format};
-use crate::session::Session;
+use crate::session::{PointerResults, Session};
 use crate::table::Entry;
 
 pub type CmdResult = Result<(), String>;
@@ -25,6 +26,7 @@ pub fn run(session: &mut Session, command: Command) -> CmdResult {
         Command::Memory(c) => memory(session, c),
         Command::Image(c) => image(session, c),
         Command::Scan(c) => scan(session, c),
+        Command::Pointer(c) => pointer(session, c),
         Command::Table(c) => table(session, c),
         Command::Tui => crate::tui::run(session),
         // Handled by the REPL loop.
@@ -376,6 +378,114 @@ fn scan(session: &mut Session, command: ScanCommand) -> CmdResult {
     Ok(())
 }
 
+fn pointer(session: &mut Session, command: PointerCommand) -> CmdResult {
+    match command {
+        PointerCommand::Scan {
+            address,
+            depth,
+            max_offset,
+            count,
+            read_only,
+        } => {
+            let target = session.eval(&address)?;
+            let options = PointerScanOptions {
+                max_depth: depth,
+                max_offset,
+                max_results: count,
+                writable_only: !read_only,
+                ..Default::default()
+            };
+            let handle = session.handle()?;
+            let start = Instant::now();
+            let paths = with_progress("building pointer map", |progress| {
+                scan_pointers(handle, target, &options, Some(progress))
+            })?;
+            let elapsed = start.elapsed().as_secs_f64();
+            println!(
+                "{} pointer paths to {target:?} ({elapsed:.2}s); see `pointer list`",
+                paths.len()
+            );
+            if paths.len() == count {
+                println!("(stopped after {count}; use --count for more)");
+            }
+            session.pointers = Some(PointerResults { target, paths });
+        }
+        PointerCommand::List { count, start } => {
+            let results = session
+                .pointers
+                .as_ref()
+                .ok_or("no pointer scan results; use `pointer scan`")?;
+            let target = session.target()?;
+            let modules = target.handle.modules().map_err(|e| e.to_string())?;
+            println!("paths to {:?}:", results.target);
+            for (i, path) in results.paths.iter().enumerate().skip(start).take(count) {
+                let now = match path.resolve(&target.handle, &modules, target.pointer_width) {
+                    Ok(a) if a == results.target => format!("{a:?}"),
+                    Ok(a) => format!("{a:?} (moved)"),
+                    Err(_) => "??".to_owned(),
+                };
+                println!("@{i:<5} {path}  -> {now}");
+            }
+            let shown = results.paths.len().saturating_sub(start).min(count);
+            if start + shown < results.paths.len() {
+                println!(
+                    "({} more; use --start/--count)",
+                    results.paths.len() - start - shown
+                );
+            }
+        }
+        PointerCommand::Filter { address } => {
+            let target = session.eval(&address)?;
+            let results = session
+                .pointers
+                .as_mut()
+                .ok_or("no pointer scan results; use `pointer scan` or `pointer load`")?;
+            let handle = &session.target.as_ref().ok_or("no process attached")?.handle;
+            let before = results.paths.len();
+            results.paths =
+                filter_pointers(handle, &results.paths, target).map_err(|e| e.to_string())?;
+            results.target = target;
+            println!(
+                "{} of {before} paths resolve to {target:?}",
+                results.paths.len()
+            );
+        }
+        PointerCommand::Save { path } => {
+            let results = session
+                .pointers
+                .as_ref()
+                .ok_or("no pointer scan results to save")?;
+            let mut text = String::new();
+            for p in &results.paths {
+                text.push_str(&p.to_string());
+                text.push('\n');
+            }
+            std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+            println!("saved {} paths to {}", results.paths.len(), path.display());
+        }
+        PointerCommand::Load { path } => {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let paths = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.parse::<PointerPath>().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            println!("loaded {} paths from {}", paths.len(), path.display());
+            println!("note: use `pointer filter <address>` to keep those that still match");
+            session.pointers = Some(PointerResults {
+                target: Address::NULL,
+                paths,
+            });
+        }
+        PointerCommand::Reset => {
+            session.pointers = None;
+            println!("pointer scan results discarded");
+        }
+    }
+    Ok(())
+}
+
 fn print_scan_summary(scan: &Scan, start: Instant) {
     let elapsed = start.elapsed().as_secs_f64();
     match scan.len() {
@@ -396,12 +506,14 @@ fn table(session: &mut Session, command: TableCommand) -> CmdResult {
             let ty = r#type
                 .or(session.scan.as_ref().map(Scan::value_type))
                 .unwrap_or(session.default_type);
-            // Scan results are only valid until the next scan; store the address itself.
+            // Scan results are only valid until the next scan: store the address itself,
+            // or for a pointer path, the path as an expression.
             if let crate::expr::Expr::ScanResult(_) = expr {
                 expr = crate::expr::Expr::Number(expr.eval(session)?.get() as u64);
             }
             let address = match expr {
                 crate::expr::Expr::Number(n) => format!("{n:#x}"),
+                crate::expr::Expr::PointerPath(i) => session.pointer(i)?.to_string(),
                 _ => address,
             };
             session.eval(&address)?;
