@@ -5,6 +5,7 @@
 //! - `process::{Process, Processes, Handle, processes, current_pid}`
 //! - `impl Handle { suspend, resume }` (in `process`)
 //! - `impl Handle { read_at, write_at, regions, protect, allocate, free }` (in `memory`)
+//! - `impl Handle { modules }` (in `module`)
 //!
 //! The facades in the crate root wrap these types one-to-one.
 

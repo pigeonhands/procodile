@@ -3,6 +3,7 @@ use std::io;
 use windows_sys::core::BOOL;
 
 pub(crate) mod memory;
+pub(crate) mod module;
 pub(crate) mod process;
 
 /// Turns a Win32 `BOOL` result into an `io::Result`, capturing `GetLastError` on failure.
