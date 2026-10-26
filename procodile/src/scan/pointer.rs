@@ -10,7 +10,7 @@
 //! process. Comparing paths across maps taken from several runs (with the target value
 //! found again in each) is the most reliable way to find paths that survive restarts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -331,22 +331,17 @@ impl PointerMap {
         }
         let graph = walk_back(self, target.get(), options);
         let mut count = 0;
-        for &(location, module) in &graph.roots {
+        for &(location, level, module) in &graph.roots {
             let module = &self.modules[module];
-            let keep_going = collect_paths(
-                &graph,
-                location,
-                target.get(),
-                &mut Vec::new(),
-                &mut |offsets| {
+            let keep_going =
+                collect_paths(&graph, (location, level), &mut Vec::new(), &mut |offsets| {
                     count += 1;
                     emit(PointerPath {
                         module: module.name.clone(),
                         module_offset: location - module.base.get(),
                         offsets: offsets.to_vec(),
                     }) && count < options.max_results
-                },
-            );
+                });
             if !keep_going {
                 break;
             }
@@ -524,18 +519,21 @@ fn is_valid(valid: &[Range<usize>], value: usize) -> bool {
     i > 0 && valid[i - 1].contains(&value)
 }
 
-/// The backwards search, as a DAG: each edge goes from a pointer's location to the address
-/// it points into, one level closer to the target.
+/// The backwards search, as a DAG over `(address, level)` nodes, where the target is at
+/// level 0. An edge goes from a pointer's location at level `n + 1` to the address it
+/// points into at level `n`, so there are no cycles. The same location can sit at several
+/// levels: a static found one step from the target can also be the start of a longer path
+/// through a different pointer.
 struct Graph {
-    /// location -> [(address it leads to, offset added)]
-    edges: HashMap<usize, Vec<(usize, usize)>>,
-    /// Static locations, with their module index, shallowest first.
-    roots: Vec<(usize, usize)>,
+    /// (location, level) -> [(address at level - 1, offset added)]
+    edges: HashMap<(usize, usize), Vec<(usize, usize)>>,
+    /// Static `(location, level, module index)`, shallowest first.
+    roots: Vec<(usize, usize, usize)>,
 }
 
 fn walk_back(map: &PointerMap, target: usize, options: &PointerScanOptions) -> Graph {
-    let mut depth: HashMap<usize, usize> = HashMap::from([(target, 0)]);
-    let mut edges: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut edges: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
     let mut roots = Vec::new();
     let mut frontier = vec![target];
 
@@ -546,24 +544,19 @@ fn walk_back(map: &PointerMap, target: usize, options: &PointerScanOptions) -> G
             let pointers = &map.by_value;
             let start = pointers.partition_point(|&(value, _)| value < low);
             for &(value, location) in pointers[start..].iter().take_while(|(v, _)| *v <= address) {
-                match depth.get(&location) {
-                    // Only link to the next level, so the graph has no cycles and every
-                    // path from a root reaches the target in exactly `level` steps.
-                    Some(&d) if d != level => continue,
-                    Some(_) => {}
-                    None => {
-                        if depth.len() >= MAX_NODES {
-                            continue;
-                        }
-                        depth.insert(location, level);
-                        match map.find_static(location) {
-                            Some(module) => roots.push((location, module)),
-                            None => next.push(location),
-                        }
+                let node = (location, level);
+                if !seen.contains(&node) {
+                    if seen.len() >= MAX_NODES {
+                        continue;
+                    }
+                    seen.insert(node);
+                    match map.find_static(location) {
+                        Some(module) => roots.push((location, level, module)),
+                        None => next.push(location),
                     }
                 }
                 edges
-                    .entry(location)
+                    .entry(node)
                     .or_default()
                     .push((address, address - value));
             }
@@ -576,21 +569,20 @@ fn walk_back(map: &PointerMap, target: usize, options: &PointerScanOptions) -> G
     Graph { edges, roots }
 }
 
-/// Depth-first enumeration of the offsets from `node` down to `target`. `emit` returns
-/// false to stop.
+/// Depth-first enumeration of the offsets from `node` at `level` down to the target at
+/// level 0. `emit` returns false to stop.
 fn collect_paths(
     graph: &Graph,
-    node: usize,
-    target: usize,
+    (node, level): (usize, usize),
     offsets: &mut Vec<usize>,
     emit: &mut dyn FnMut(&[usize]) -> bool,
 ) -> bool {
-    if node == target && !offsets.is_empty() {
+    if level == 0 {
         return emit(offsets);
     }
-    for &(next, offset) in graph.edges.get(&node).into_iter().flatten() {
+    for &(next, offset) in graph.edges.get(&(node, level)).into_iter().flatten() {
         offsets.push(offset);
-        let keep_going = collect_paths(graph, next, target, offsets, emit);
+        let keep_going = collect_paths(graph, (next, level - 1), offsets, emit);
         offsets.pop();
         if !keep_going {
             return false;
@@ -745,6 +737,35 @@ mod tests {
         );
 
         drop(unsafe { Box::from_raw(SAVE.swap(std::ptr::null_mut(), Ordering::SeqCst)) });
+    }
+
+    /// A static found one step from the target must not hide a longer path through it.
+    #[test]
+    fn location_can_start_paths_of_several_depths() {
+        let (s, a, target) = (0x1000, 0x5000, 0x5040);
+        let module = MapModule {
+            name: "game".into(),
+            base: Address::new(s),
+            statics: Address::new(s)..Address::new(s + 0x100),
+        };
+        // s -> a (so [s]+0x40 is the target directly), and a+0x8 -> a, so
+        // [[s]+0x8]+0x40 reaches it through a second pointer.
+        let map = PointerMap::from_parts(8, vec![module], vec![(a, s), (a, a + 0x8)]);
+        let options = PointerScanOptions {
+            max_depth: 2,
+            max_offset: 0x100,
+            ..Default::default()
+        };
+        let paths: Vec<String> = map
+            .scan(Address::new(target), &options)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(paths.contains(&"[game+0x0]+0x40".to_owned()), "{paths:?}");
+        assert!(
+            paths.contains(&"[[game+0x0]+0x8]+0x40".to_owned()),
+            "{paths:?}"
+        );
     }
 
     #[test]
