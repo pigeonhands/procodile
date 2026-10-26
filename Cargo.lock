@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "procodile"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "procodile-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "ctrlc",
