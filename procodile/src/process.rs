@@ -187,7 +187,17 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let handle = ProcessHandle::open(child.id(), Access::ReadWrite).unwrap();
+        // Opening can briefly fail with EACCES while the child is still in exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let handle = loop {
+            match ProcessHandle::open(child.id(), Access::ReadWrite) {
+                Ok(handle) => break handle,
+                Err(e) if std::time::Instant::now() < deadline && e.is_permission_denied() => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
         handle.suspend().unwrap();
         handle.resume().unwrap();
         child.kill().unwrap();
