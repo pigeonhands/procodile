@@ -15,12 +15,12 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
-clap = { version = "4.5.58", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 ctrlc = "3.5.2"
 procodile = { path = "../procodile", version = "0.2.1" }
 ratatui = "0.30.2"
 rusqlite = { version = "0.41.0", features = ["bundled"], optional = true }
-rustyline = "17.0.2"
+rustyline = "19.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 

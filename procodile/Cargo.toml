@@ -10,7 +10,7 @@ keywords = ["memory", "process", "scanner", "cheat-engine", "reverse-engineering
 categories = ["development-tools::debugging", "os"]
 
 [dependencies]
-thiserror = "2.0.18"
+thiserror = "2.0.21"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"
