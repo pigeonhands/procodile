@@ -1,7 +1,13 @@
 //! A full-screen interface over the same [`Session`] as the REPL.
 //!
-//! Panes: scan results (left), the address table (right) and a memory view of the
-//! selection (bottom). Scans run on a background thread so the UI stays live.
+//! Panes: value scan results or pointer paths (left), the address table (right) and a
+//! memory or struct view of the selection (bottom). Scans run on a background thread so
+//! the UI stays live. Popups: help, the process picker, the struct editor and the pointer
+//! scan options.
+
+mod editor;
+mod help;
+mod pointer_form;
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -9,7 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use procodile::scan::{Progress, Scan, ScanOptions, ValueType};
+use procodile::scan::{
+    PointerMap, PointerMapOptions, PointerPath, Progress, Scan, ScanOptions, ValueType,
+    filter_pointers,
+};
+use procodile::structs::Structs;
 use procodile::{Address, Module};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -22,8 +32,10 @@ use crate::commands::{
     default_tolerance, describe, parse_condition, parse_value, render_struct_at, table_line,
 };
 use crate::format::{self, Format};
-use crate::session::Session;
+use crate::session::{PointerResults, Session};
 use crate::table::Entry;
+use editor::{Editor, EditorAction};
+use pointer_form::{FormAction, PointerForm, PointerRequest};
 
 /// Set while the TUI runs, so `:tui` inside it is refused.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -43,11 +55,38 @@ enum Focus {
     Table,
 }
 
+/// What the left pane shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftView {
+    Values,
+    Pointers,
+}
+
 enum Mode {
     Normal,
-    Input { kind: InputKind, buffer: String },
+    Input {
+        kind: InputKind,
+        buffer: String,
+    },
     Picker(Picker),
+    Help,
+    Structs {
+        editor: Editor,
+        error: Option<String>,
+    },
+    PointerForm(PointerForm),
 }
+
+const STRUCT_TEMPLATE: &str = "\
+// Define structs in Rust syntax; Ctrl-S saves, Esc discards.
+// #[repr(C)] layout; #[offset(0x40)] pins a field's offset.
+//
+// struct Player {
+//     name: *const c_char,
+//     stats: *const Stats,
+//     level: u32,
+// }
+";
 
 #[derive(Clone, Copy)]
 enum InputKind {
@@ -56,6 +95,7 @@ enum InputKind {
     WriteEntry(usize),
     Describe(usize),
     StructView,
+    FilterPointers,
     Command,
 }
 
@@ -67,6 +107,7 @@ impl InputKind {
             InputKind::WriteEntry(_) => "new value: ",
             InputKind::Describe(_) => "description: ",
             InputKind::StructView => "view selection as struct (empty for hex): ",
+            InputKind::FilterPointers => "keep paths that lead to address: ",
             InputKind::Command => ":",
         }
     }
@@ -109,22 +150,35 @@ impl Picker {
     }
 }
 
-type ScanJob = JoinHandle<(Option<Scan>, Result<Scan, procodile::Error>)>;
+enum JobResult {
+    Scan {
+        /// The scan being narrowed, handed back if the next scan fails.
+        previous: Option<Scan>,
+        first: bool,
+        result: Result<Scan, procodile::Error>,
+    },
+    Pointers {
+        target: Address,
+        /// The map built for a live scan, to save when a pointer database is open.
+        result: Result<(Vec<PointerPath>, Option<PointerMap>), procodile::Error>,
+    },
+}
 
 struct Job {
     progress: Arc<Progress>,
-    thread: ScanJob,
+    thread: JoinHandle<JobResult>,
     started: Instant,
-    /// The scan being narrowed, handed back if the job fails.
-    first: bool,
 }
 
 struct App<'s> {
     session: &'s mut Session,
     focus: Focus,
     mode: Mode,
+    left: LeftView,
     scan_selected: usize,
     scan_offset: usize,
+    pointer_selected: usize,
+    pointer_offset: usize,
     table_selected: usize,
     status: String,
     job: Option<Job>,
@@ -142,7 +196,7 @@ impl<'s> App<'s> {
     fn new(session: &'s mut Session) -> Self {
         let status = match &session.target {
             Some(_) => {
-                "Tab: switch pane  f/n: scan  p: process  : command  ?: help  q: quit".into()
+                "f/n: value scan  P: pointer scan  s: structs  p: process  ?: help  q: quit".into()
             }
             None => "press p to pick a process to attach to".into(),
         };
@@ -150,8 +204,11 @@ impl<'s> App<'s> {
             session,
             focus: Focus::Scan,
             mode: Mode::Normal,
+            left: LeftView::Values,
             scan_selected: 0,
             scan_offset: 0,
+            pointer_selected: 0,
+            pointer_offset: 0,
             table_selected: 0,
             status,
             job: None,
@@ -231,28 +288,84 @@ impl<'s> App<'s> {
                 ..ScanOptions::new(ty)
             };
             let progress = progress.clone();
-            thread::spawn(move || {
-                (
-                    None,
-                    Scan::first(&handle, options, compare, Some(&progress)),
-                )
+            thread::spawn(move || JobResult::Scan {
+                previous: None,
+                first: true,
+                result: Scan::first(&handle, options, compare, Some(&progress)),
             })
         } else {
             let mut scan = self.session.scan.take().unwrap();
             let progress = progress.clone();
             thread::spawn(move || match scan.next(&handle, compare, Some(&progress)) {
-                Ok(()) => (None, Ok(scan)),
-                Err(e) => (Some(scan), Err(e)),
+                Ok(()) => JobResult::Scan {
+                    previous: None,
+                    first: false,
+                    result: Ok(scan),
+                },
+                Err(e) => JobResult::Scan {
+                    previous: Some(scan),
+                    first: false,
+                    result: Err(e),
+                },
             })
         };
         self.job = Some(Job {
             progress,
             thread,
             started: Instant::now(),
-            first,
         });
+        self.left = LeftView::Values;
         self.scan_selected = 0;
         self.scan_offset = 0;
+    }
+
+    fn start_pointer_scan(&mut self, request: PointerRequest) -> Result<(), String> {
+        if self.job.is_some() {
+            return Err("a scan is already running".into());
+        }
+        let (target, saved) = match request.map {
+            Some(id) => {
+                let (info, map) = self.session.pointer_db()?.load_map(id)?;
+                let target = match request.target.as_str() {
+                    "" => info.target,
+                    expr => self.session.eval(expr)?,
+                };
+                (target, Some(map))
+            }
+            None => (self.session.eval(&request.target)?, None),
+        };
+        let options = request.options;
+        let progress = Arc::new(Progress::new());
+        let thread = match saved {
+            Some(map) => thread::spawn(move || JobResult::Pointers {
+                target,
+                result: Ok((map.scan(target, &options), None)),
+            }),
+            None => {
+                let handle = self.session.target()?.handle.clone();
+                let keep_map = self.session.pointer_db.is_some();
+                let map_options = PointerMapOptions {
+                    writable_only: !request.read_only,
+                    ..Default::default()
+                };
+                let progress = progress.clone();
+                thread::spawn(move || JobResult::Pointers {
+                    target,
+                    result: PointerMap::build(&handle, &map_options, Some(&progress)).map(|map| {
+                        let paths = map.scan(target, &options);
+                        (paths, keep_map.then_some(map))
+                    }),
+                })
+            }
+        };
+        self.job = Some(Job {
+            progress,
+            thread,
+            started: Instant::now(),
+        });
+        self.left = LeftView::Pointers;
+        self.focus = Focus::Scan;
+        Ok(())
     }
 
     fn poll_job(&mut self) {
@@ -261,20 +374,54 @@ impl<'s> App<'s> {
         }
         let job = self.job.take().unwrap();
         let elapsed = job.started.elapsed().as_secs_f64();
-        let (previous, result) = job.thread.join().expect("scan thread panicked");
-        match result {
-            Ok(scan) => {
-                self.status = format!("{} results ({elapsed:.2}s)", scan.len());
-                self.session.scan = Some(scan);
-            }
-            Err(e) => {
-                self.session.scan = previous;
-                self.status = match e {
-                    procodile::Error::Cancelled if job.first => "scan cancelled".into(),
-                    procodile::Error::Cancelled => "scan cancelled; previous results kept".into(),
-                    e => format!("error: {e}"),
-                };
-            }
+        match job.thread.join().expect("scan thread panicked") {
+            JobResult::Scan {
+                previous,
+                first,
+                result,
+            } => match result {
+                Ok(scan) => {
+                    self.status = format!("{} results ({elapsed:.2}s)", scan.len());
+                    self.session.scan = Some(scan);
+                }
+                Err(e) => {
+                    self.session.scan = previous;
+                    self.status = match e {
+                        procodile::Error::Cancelled if first => "scan cancelled".into(),
+                        procodile::Error::Cancelled => {
+                            "scan cancelled; previous results kept".into()
+                        }
+                        e => format!("error: {e}"),
+                    };
+                }
+            },
+            JobResult::Pointers { target, result } => match result {
+                Ok((paths, map)) => {
+                    let mut status = format!(
+                        "{} pointer paths to {target:?} ({elapsed:.2}s)",
+                        paths.len()
+                    );
+                    if let (Some(map), Ok(t)) = (map, self.session.target())
+                        && let Ok(db) = self.session.pointer_db()
+                    {
+                        match db.save_map("tui scan", &t.name, t.pid, target, &map) {
+                            Ok(id) => status.push_str(&format!("; saved as map {id}")),
+                            Err(e) => status.push_str(&format!("; map not saved: {e}")),
+                        }
+                    }
+                    if let Err(e) = self
+                        .session
+                        .set_pointers(Some(PointerResults { target, paths }))
+                    {
+                        status = format!("error: {e}");
+                    }
+                    self.status = status;
+                    self.pointer_selected = 0;
+                    self.pointer_offset = 0;
+                }
+                Err(procodile::Error::Cancelled) => self.status = "pointer scan cancelled".into(),
+                Err(e) => self.status = format!("error: {e}"),
+            },
         }
     }
 
@@ -308,6 +455,34 @@ impl<'s> App<'s> {
         }
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.on_normal_key(key, ctrl_c),
+            // Any key closes the help.
+            Mode::Help => {}
+            Mode::Structs { mut editor, error } => match editor.on_key(key) {
+                EditorAction::None => self.mode = Mode::Structs { editor, error },
+                EditorAction::Cancel => self.status = "struct edits discarded".into(),
+                EditorAction::Save => match self.save_structs(&editor.text()) {
+                    Ok(status) => self.status = status,
+                    Err((line, e)) => {
+                        if let Some(line) = line {
+                            editor.go_to_line(line);
+                        }
+                        self.mode = Mode::Structs {
+                            editor,
+                            error: Some(e),
+                        };
+                    }
+                },
+            },
+            Mode::PointerForm(mut form) => match form.on_key(key) {
+                FormAction::None => self.mode = Mode::PointerForm(form),
+                FormAction::Cancel => {}
+                FormAction::Submit(request) => {
+                    if let Err(e) = self.start_pointer_scan(request) {
+                        form.error = Some(e);
+                        self.mode = Mode::PointerForm(form);
+                    }
+                }
+            },
             Mode::Input { kind, mut buffer } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => self.submit(kind, buffer),
@@ -382,12 +557,42 @@ impl<'s> App<'s> {
             KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX / 2),
             KeyCode::Char('p') => self.mode = Mode::Picker(Picker::new()),
             KeyCode::Char(':') => self.mode = input(InputKind::Command),
-            KeyCode::Char('?') => {
-                self.status = "f first scan  n next scan  r reset  t type  a add to table  \
-                    space freeze  e edit  D describe  d delete  v struct view  p process  \
-                    : command"
-                    .into()
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('1') => {
+                self.left = LeftView::Values;
+                self.focus = Focus::Scan;
             }
+            KeyCode::Char('2') => {
+                self.left = LeftView::Pointers;
+                self.focus = Focus::Scan;
+            }
+            KeyCode::Char('s') => {
+                let text = match self.session.structs.is_empty() {
+                    true => STRUCT_TEMPLATE.to_owned(),
+                    false => self.session.structs.to_string(),
+                };
+                self.mode = Mode::Structs {
+                    editor: Editor::new(&text),
+                    error: None,
+                };
+            }
+            KeyCode::Char('P') => {
+                let target = self
+                    .selected_address()
+                    .map(|a| format!("{:#x}", a.get()))
+                    .unwrap_or_default();
+                self.mode = Mode::PointerForm(PointerForm::new(target));
+            }
+            KeyCode::Char('x') if self.on_pointers() && self.session.pointers.is_some() => {
+                self.mode = input(InputKind::FilterPointers)
+            }
+            KeyCode::Char('r') if self.on_pointers() && self.job.is_none() => {
+                self.status = match self.session.set_pointers(None) {
+                    Ok(()) => "pointer paths discarded".into(),
+                    Err(e) => format!("error: {e}"),
+                };
+            }
+            KeyCode::Char('a') | KeyCode::Enter if self.on_pointers() => self.add_selected_path(),
             KeyCode::Char('f') => self.mode = input(InputKind::FirstScan),
             KeyCode::Char('v') => {
                 if self.session.structs.is_empty() {
@@ -420,6 +625,7 @@ impl<'s> App<'s> {
                 self.session.default_type = all[(i + 1) % all.len()];
             }
             KeyCode::Char('a') | KeyCode::Enter if self.focus == Focus::Scan => self.add_selected(),
+
             KeyCode::Char(' ') if self.focus == Focus::Table => self.toggle_freeze(),
             KeyCode::Char('e') | KeyCode::Enter if self.focus == Focus::Table => {
                 if self.table_selected < self.session.table.entries.len() {
@@ -468,6 +674,22 @@ impl<'s> App<'s> {
                     self.status = format!("no struct '{name}' (have: {})", names.join(", "));
                 }
             }
+            InputKind::FilterPointers => {
+                let result = (|| {
+                    let target = self.session.eval(&buffer)?;
+                    let results = self.session.pointers.as_ref().ok_or("no pointer paths")?;
+                    let before = results.paths.len();
+                    let paths = filter_pointers(self.session.handle()?, &results.paths, target)
+                        .map_err(|e| e.to_string())?;
+                    let kept = paths.len();
+                    self.session
+                        .set_pointers(Some(PointerResults { target, paths }))?;
+                    Ok::<_, String>(format!("{kept} of {before} paths lead to {target:?}"))
+                })();
+                self.status = result.unwrap_or_else(|e| format!("error: {e}"));
+                self.pointer_selected = 0;
+                self.pointer_offset = 0;
+            }
             InputKind::Describe(i) => {
                 if let Ok(entry) = self.session.table.get_mut(i) {
                     entry.description = buffer;
@@ -506,6 +728,57 @@ impl<'s> App<'s> {
         self.status = format!("added ${}", self.session.table.entries.len() - 1);
     }
 
+    fn on_pointers(&self) -> bool {
+        self.focus == Focus::Scan && self.left == LeftView::Pointers
+    }
+
+    fn add_selected_path(&mut self) {
+        let Ok(path) = self.session.pointer(self.pointer_selected) else {
+            return;
+        };
+        let address = path.to_string();
+        let value_type = self
+            .session
+            .scan
+            .as_ref()
+            .map_or(self.session.default_type, Scan::value_type);
+        self.session.table.entries.push(Entry {
+            description: String::new(),
+            address,
+            value_type,
+            frozen: None,
+        });
+        self.status = format!("added ${}", self.session.table.entries.len() - 1);
+    }
+
+    /// Replaces all struct definitions with those in `text`. On failure, returns the line
+    /// to jump to (if known) and the error.
+    fn save_structs(&mut self, text: &str) -> Result<String, (Option<usize>, String)> {
+        let mut structs = Structs::new();
+        let names = structs
+            .define(text)
+            .map_err(|e| (Some(e.line), e.to_string()))?;
+        let width = self
+            .session
+            .target
+            .as_ref()
+            .map_or(size_of::<usize>(), |t| t.pointer_width);
+        let broken: Vec<String> = names
+            .iter()
+            .filter_map(|n| structs.layout(n, width).err().map(|e| format!("{n}: {e}")))
+            .collect();
+        if !broken.is_empty() {
+            return Err((None, broken.join("; ")));
+        }
+        if let Some(view) = &self.struct_view
+            && structs.get(view).is_none()
+        {
+            self.struct_view = None;
+        }
+        self.session.structs = structs;
+        Ok(format!("{} structs defined", names.len()))
+    }
+
     fn toggle_freeze(&mut self) {
         let i = self.table_selected;
         let Ok(entry) = self.session.table.get(i) else {
@@ -522,12 +795,14 @@ impl<'s> App<'s> {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let (selected, len) = match self.focus {
-            Focus::Scan => (
+        let pointers = self.session.pointers.as_ref().map_or(0, |p| p.paths.len());
+        let (selected, len) = match (self.focus, self.left) {
+            (Focus::Scan, LeftView::Pointers) => (&mut self.pointer_selected, pointers),
+            (Focus::Scan, LeftView::Values) => (
                 &mut self.scan_selected,
                 self.session.scan.as_ref().map_or(0, Scan::len),
             ),
-            Focus::Table => (&mut self.table_selected, self.session.table.entries.len()),
+            (Focus::Table, _) => (&mut self.table_selected, self.session.table.entries.len()),
         };
         *selected = selected
             .saturating_add_signed(delta)
@@ -539,9 +814,18 @@ impl<'s> App<'s> {
         self.scan_selected = self.scan_selected.min(scan_len.saturating_sub(1));
         let table_len = self.session.table.entries.len();
         self.table_selected = self.table_selected.min(table_len.saturating_sub(1));
+        let pointers = self.session.pointers.as_ref().map_or(0, |p| p.paths.len());
+        self.pointer_selected = self.pointer_selected.min(pointers.saturating_sub(1));
     }
 
     fn selected_address(&self) -> Option<Address> {
+        if self.on_pointers() {
+            let target = self.session.target.as_ref()?;
+            let path = self.session.pointer(self.pointer_selected).ok()?;
+            return path
+                .resolve(&target.handle, &self.modules, target.pointer_width)
+                .ok();
+        }
         match self.focus {
             Focus::Scan => self
                 .session
@@ -573,12 +857,19 @@ impl<'s> App<'s> {
                 .areas(body);
 
         self.draw_title(f, top);
-        self.draw_scan(f, left);
+        match self.left {
+            LeftView::Values => self.draw_scan(f, left),
+            LeftView::Pointers => self.draw_pointers(f, left),
+        }
         self.draw_table(f, right);
         self.draw_memory(f, memory);
         self.draw_status(f, bottom);
-        if let Mode::Picker(picker) = &mut self.mode {
-            draw_picker(f, picker);
+        match &mut self.mode {
+            Mode::Picker(picker) => draw_picker(f, picker),
+            Mode::Help => help::draw(f),
+            Mode::Structs { editor, error } => draw_editor(f, editor, error.as_deref()),
+            Mode::PointerForm(form) => form.draw(f),
+            Mode::Normal | Mode::Input { .. } => {}
         }
     }
 
@@ -614,29 +905,11 @@ impl<'s> App<'s> {
             Some(scan) => format!(" Scan {ty}: {} results ", scan.len()),
             None => format!(" Scan {ty} (t: change type, f: first scan) "),
         };
+        let title = format!("{title}─ 1: values  2: pointers ");
         let block = self.pane_block(title, Focus::Scan);
         let inner = block.inner(area);
         f.render_widget(block, area);
-
-        if let Some(job) = &self.job {
-            let [_, gauge, _] = Layout::vertical([
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .areas(inner);
-            let label = format!(
-                "{:.0}% of {}  (Ctrl-C to cancel)",
-                job.progress.fraction() * 100.0,
-                format::bytes(job.progress.total())
-            );
-            f.render_widget(
-                Gauge::default()
-                    .ratio(job.progress.fraction().clamp(0.0, 1.0))
-                    .label(label)
-                    .gauge_style(Style::new().fg(Color::Cyan)),
-                gauge,
-            );
+        if self.draw_job(f, inner) {
             return;
         }
         let Some(scan) = &self.session.scan else {
@@ -672,6 +945,104 @@ impl<'s> App<'s> {
                 ]);
                 let item = ListItem::new(line);
                 if i == self.scan_selected && self.focus == Focus::Scan {
+                    item.style(Style::new().add_modifier(Modifier::REVERSED))
+                } else {
+                    item
+                }
+            })
+            .collect();
+        f.render_widget(List::new(items), inner);
+    }
+
+    /// Draws the running job's progress, if there is one.
+    fn draw_job(&self, f: &mut Frame, area: Rect) -> bool {
+        let Some(job) = &self.job else {
+            return false;
+        };
+        let [_, gauge, _] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        let label = match job.progress.total() {
+            0 => "scanning...  (Ctrl-C to cancel)".to_owned(),
+            total => format!(
+                "{:.0}% of {}  (Ctrl-C to cancel)",
+                job.progress.fraction() * 100.0,
+                format::bytes(total)
+            ),
+        };
+        f.render_widget(
+            Gauge::default()
+                .ratio(job.progress.fraction().clamp(0.0, 1.0))
+                .label(label)
+                .gauge_style(Style::new().fg(Color::Cyan)),
+            gauge,
+        );
+        true
+    }
+
+    fn draw_pointers(&mut self, f: &mut Frame, area: Rect) {
+        let title = match &self.session.pointers {
+            Some(p) => format!(
+                " Pointer paths: {} to {:?} (P: scan, x: filter) ",
+                p.paths.len(),
+                p.target
+            ),
+            None => " Pointer paths (P: pointer scan) ".to_owned(),
+        };
+        let title = format!("{title}─ 1: values  2: pointers ");
+        let block = self.pane_block(title, Focus::Scan);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if self.draw_job(f, inner) {
+            return;
+        }
+        let Some(results) = &self.session.pointers else {
+            f.render_widget(
+                Paragraph::new("select an address and press P to find pointer paths to it").dim(),
+                inner,
+            );
+            return;
+        };
+
+        let rows = inner.height as usize;
+        if self.pointer_selected < self.pointer_offset {
+            self.pointer_offset = self.pointer_selected;
+        } else if rows > 0 && self.pointer_selected >= self.pointer_offset + rows {
+            self.pointer_offset = self.pointer_selected + 1 - rows;
+        }
+        let ty = self
+            .session
+            .scan
+            .as_ref()
+            .map_or(self.session.default_type, Scan::value_type);
+        let target = self.session.target.as_ref();
+        let items: Vec<ListItem> = results
+            .paths
+            .iter()
+            .enumerate()
+            .skip(self.pointer_offset)
+            .take(rows)
+            .map(|(i, path)| {
+                let resolved = target
+                    .and_then(|t| path.resolve(&t.handle, &self.modules, t.pointer_width).ok());
+                let now = match resolved {
+                    Some(a) => {
+                        let value = self
+                            .session
+                            .read_value(a, ty)
+                            .map_or("??".into(), |v| v.to_string());
+                        format!("-> {a:?} = {value}")
+                    }
+                    None => "-> ??".to_owned(),
+                };
+                let item = ListItem::new(Line::from(vec![
+                    Span::raw(format!("@{i:<5}{path}  ")),
+                    Span::raw(now).dim(),
+                ]));
+                if i == self.pointer_selected && self.focus == Focus::Scan {
                     item.style(Style::new().add_modifier(Modifier::REVERSED))
                 } else {
                     item
@@ -777,6 +1148,47 @@ impl<'s> App<'s> {
         };
         f.render_widget(Paragraph::new(line), area);
     }
+}
+
+fn draw_editor(f: &mut Frame, editor: &mut Editor, error: Option<&str>) {
+    let area = f.area();
+    let popup = help::popup(area, area.width * 4 / 5, area.height * 4 / 5);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Struct definitions (Rust syntax) ")
+        .border_style(Style::new().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let [text, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let height = text.height as usize;
+    editor.scroll_to_cursor(height);
+    let gutter = 5;
+    let lines: Vec<Line> = editor
+        .lines()
+        .iter()
+        .enumerate()
+        .skip(editor.scroll)
+        .take(height)
+        .map(|(i, line)| {
+            Line::from(vec![
+                Span::raw(format!("{:>3} │", i + 1)).dim(),
+                Span::raw(line.as_str()),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), text);
+
+    let (row, col) = editor.cursor();
+    f.set_cursor_position((
+        text.x + gutter + col as u16,
+        text.y + (row - editor.scroll) as u16,
+    ));
+    let footer_line = match error {
+        Some(e) => Line::from(format!("error: {e}")).red(),
+        None => Line::from("Ctrl-S: save  Esc: discard  Tab: indent").fg(Color::DarkGray),
+    };
+    f.render_widget(Paragraph::new(footer_line), footer);
 }
 
 fn draw_picker(f: &mut Frame, picker: &mut Picker) {

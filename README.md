@@ -50,6 +50,29 @@ Process 4242 (target) attached
 
 Type `tui` at the prompt (or start with `procodile -o tui`) for the full-screen interface.
 
+## The TUI
+
+The TUI shares its state with the REPL, so scans, the address table, pointer paths and
+struct definitions carry over in both directions.
+
+- **Left pane:** value scan results (`1`) or pointer paths (`2`).
+- **Right pane:** the address table.
+- **Bottom pane:** the selected address, as hex or as a struct.
+
+Press `?` for the full key list. The main keys:
+
+| Key | |
+| --- | --- |
+| `f` / `n` | first / next value scan |
+| `P` | pointer scan options for the selected address: depth, max offset, result limit, read-only memory, or a saved map to scan offline |
+| `x` | (pointer paths) keep only paths that lead to an address |
+| `s` | edit struct definitions in a popup editor (Ctrl-S saves, Esc discards) |
+| `v` | view the selection as a struct |
+| `a` / `Enter` | add the selected scan result or pointer path to the table |
+| `Space` / `e` | freeze / write the selected table entry |
+| `p` | pick a process to attach to |
+| `:` | run any REPL command |
+
 ## The REPL
 
 Commands follow lldb's `noun verb [options]` shape. Any unique prefix works (`mem re` is
@@ -156,7 +179,9 @@ the fields: pointers into mapped memory, text, plausible floats, zeros and integ
 `-n <name>` also defines the guess as a structure (with fields named after their offsets)
 to save, rename and refine.
 
-In the TUI, select a scan result or table entry and press `v` to view it as a structure
+In the TUI, press `s` to edit all definitions in a popup editor (parse errors are shown
+and the cursor jumps to the line). Select a scan result, pointer path or table entry and
+press `v` to view it as a structure
 instead of hex. The view updates live; `+`/`-` change the pointer depth and `[`/`]`
 scroll. Press `v` and submit an empty name to go back to hex.
 
