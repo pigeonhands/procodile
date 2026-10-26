@@ -87,9 +87,17 @@ impl PointerPath {
             .iter()
             .find(|m| m.name.to_string_lossy() == self.module)
             .ok_or_else(|| Error::InvalidScan(format!("module '{}' is not loaded", self.module)))?;
-        let mut address = module.base + self.module_offset;
+        // A stale path can read garbage, so the arithmetic must not overflow.
+        let overflow = || Error::InvalidScan(format!("pointer path {self} leads out of range"));
+        let mut address = module
+            .base
+            .checked_add(self.module_offset)
+            .ok_or_else(overflow)?;
         for &offset in &self.offsets {
-            address = handle.read_pointer(address, pointer_width)? + offset;
+            address = handle
+                .read_pointer(address, pointer_width)?
+                .checked_add(offset)
+                .ok_or_else(overflow)?;
         }
         Ok(address)
     }
@@ -747,6 +755,26 @@ mod tests {
         map.write_to(&mut bytes).unwrap();
         assert_eq!(PointerMap::read_from(bytes.as_slice()).unwrap(), map);
         assert!(PointerMap::read_from(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn resolving_garbage_does_not_overflow() {
+        static HIGH: usize = usize::MAX - 4;
+        let handle = ProcessHandle::open_current().unwrap();
+        let modules = handle.modules().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let exe = exe.file_name().unwrap().to_string_lossy().into_owned();
+        let module = modules
+            .iter()
+            .find(|m| m.name.to_string_lossy() == exe)
+            .unwrap();
+        let path = PointerPath {
+            module: exe,
+            module_offset: &raw const HIGH as usize - module.base.get(),
+            offsets: vec![0x100],
+        };
+        let width = handle.pointer_width().unwrap();
+        assert!(path.resolve(&handle, &modules, width).is_err());
     }
 
     #[test]
