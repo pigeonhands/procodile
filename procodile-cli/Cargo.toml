@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "An lldb-style REPL and TUI for scanning and editing process memory, built on procodile"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["memory", "cheat-engine", "tui", "repl", "reverse-engineering"]
 categories = ["command-line-utilities", "development-tools::debugging"]
 

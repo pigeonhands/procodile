@@ -1,9 +1,4 @@
-//! Cross-platform primitives for inspecting and modifying the memory of other processes.
-//!
-//! The layout follows the standard library: the public modules (`process`, `memory`, ...)
-//! are thin, platform-independent facades over `sys`, which holds one backend per OS.
-//! Functionality that only exists on one platform is exposed through extension traits
-//! in [`os`].
+#![doc = include_str!("../README.md")]
 
 pub mod address;
 pub mod error;
