@@ -334,8 +334,8 @@ pub enum PointerMapCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum StructCommand {
-    /// Define structures in C-like syntax, e.g.
-    /// `struct define 'struct Stats { i32 armor; i32 health; };'`.
+    /// Define structures in Rust syntax, e.g.
+    /// `struct define 'struct Stats { armor: i32, health: i32 }'`.
     Define {
         /// Definitions; several words are joined with spaces.
         #[arg(required = true, num_args = 1..)]

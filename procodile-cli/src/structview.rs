@@ -115,17 +115,12 @@ pub fn layout(structs: &Structs, layout: &Layout, pointer_width: usize) -> Vec<S
                 f.offset - end
             ));
         }
-        let ty = f.ty.to_string();
-        let (base, suffix) = match ty.find('[') {
-            Some(i) => (&ty[..i], &ty[i..]),
-            None => (ty.as_str(), ""),
-        };
-        let sep = if base.ends_with('*') { "" } else { " " };
         lines.push(format!(
-            "/* {:#6x} | {:#4x} */      {base}{sep}{}{suffix};{}",
+            "/* {:#6x} | {:#4x} */      {}: {},{}",
             f.offset,
             f.size,
             f.name,
+            f.ty,
             nested_hint(structs, &f.ty, pointer_width)
         ));
         end = f.offset + f.size;

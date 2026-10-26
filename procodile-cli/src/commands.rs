@@ -721,7 +721,7 @@ fn structs(session: &mut Session, command: StructCommand) -> CmdResult {
                     GuessKind::I32(v) => format!("{v} ({:#x})", *v as u32),
                     GuessKind::Zero => "0".to_owned(),
                 };
-                println!("[{:#6x}] {:<10} {value}", g.offset, g.ty().to_string());
+                println!("[{:#6x}] {:<16} {value}", g.offset, g.ty().to_string());
             }
             if let Some(name) = name {
                 let def = procodile::structs::guesses_to_struct(&name, &guesses);

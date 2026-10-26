@@ -1,20 +1,21 @@
 //! Structure definitions: describing how data is laid out in another process, so it can be
 //! read as named fields instead of raw bytes.
 //!
-//! Definitions use a C-like syntax, so they can be pasted from headers or reverse
-//! engineering tools:
+//! Definitions use Rust's struct syntax:
 //!
 //! ```text
 //! struct Player {
-//!     u32 level;
-//!     char name[16];
-//!     Stats *stats;
-//!     0x40: f32 position[3];   // explicit offset; the gap is padding
-//! };
+//!     level: u32,
+//!     name: [c_char; 16],
+//!     stats: *const Stats,
+//!     #[offset(0x40)]          // explicit offset; the gap is padding
+//!     position: [f32; 3],
+//! }
 //! ```
 //!
-//! Fields are laid out with C's natural alignment unless given an explicit offset. Layout
-//! depends on the target's pointer size, so it is computed per use rather than stored.
+//! Fields are laid out as with `#[repr(C)]`: in order, with natural alignment, unless given
+//! an explicit offset. Layout depends on the target's pointer size, so it is computed per
+//! use rather than stored.
 
 mod parse;
 mod read;
@@ -39,7 +40,8 @@ pub enum Primitive {
     F32,
     F64,
     Bool,
-    /// A byte shown as a character; `char[N]` is shown as a string.
+    /// A byte shown as a character (`c_char`); arrays of it and pointers to it are shown
+    /// as strings.
     Char,
     /// An unsigned integer the size of a pointer (`usize`, `size_t`, `uintptr_t`).
     USize,
@@ -71,29 +73,29 @@ impl Primitive {
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::Bool => "bool",
-            Self::Char => "char",
+            Self::Char => "c_char",
             Self::USize => "usize",
             Self::ISize => "isize",
         }
     }
 
-    /// Recognizes Rust names and common C spellings.
+    /// Recognizes Rust's primitive names and the fixed-size `std::ffi` C types.
     pub fn from_name(name: &str) -> Option<Primitive> {
         Some(match name {
-            "i8" | "int8_t" | "signed char" => Self::I8,
-            "u8" | "uint8_t" | "unsigned char" | "byte" | "BYTE" => Self::U8,
-            "i16" | "int16_t" | "short" | "signed short" => Self::I16,
-            "u16" | "uint16_t" | "unsigned short" | "WORD" => Self::U16,
-            "i32" | "int32_t" | "int" | "signed int" | "signed" => Self::I32,
-            "u32" | "uint32_t" | "unsigned int" | "unsigned" | "DWORD" => Self::U32,
-            "i64" | "int64_t" | "long long" | "signed long long" => Self::I64,
-            "u64" | "uint64_t" | "unsigned long long" | "QWORD" => Self::U64,
-            "f32" | "float" => Self::F32,
-            "f64" | "double" => Self::F64,
-            "bool" | "_Bool" => Self::Bool,
-            "char" => Self::Char,
-            "usize" | "size_t" | "uintptr_t" => Self::USize,
-            "isize" | "ssize_t" | "intptr_t" | "ptrdiff_t" => Self::ISize,
+            "i8" | "c_schar" => Self::I8,
+            "u8" | "c_uchar" => Self::U8,
+            "i16" | "c_short" => Self::I16,
+            "u16" | "c_ushort" => Self::U16,
+            "i32" | "c_int" => Self::I32,
+            "u32" | "c_uint" => Self::U32,
+            "i64" | "c_longlong" => Self::I64,
+            "u64" | "c_ulonglong" => Self::U64,
+            "f32" | "c_float" => Self::F32,
+            "f64" | "c_double" => Self::F64,
+            "bool" => Self::Bool,
+            "c_char" => Self::Char,
+            "usize" => Self::USize,
+            "isize" => Self::ISize,
             _ => return None,
         })
     }
@@ -102,7 +104,7 @@ impl Primitive {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Primitive(Primitive),
-    /// A pointer; `void *` is a pointer to `Void`.
+    /// A pointer (`*const T` or `*mut T`); `*const c_void` points to `Void`.
     Pointer(Box<Type>),
     Array(Box<Type>, usize),
     /// A structure, by name.
@@ -111,35 +113,16 @@ pub enum Type {
     Void,
 }
 
-impl Type {
-    /// The type as it is written before a field name, and the array suffix after it,
-    /// e.g. (`Stats *`, ``) or (`char`, `[16]`).
-    fn c_parts(&self) -> (String, String) {
-        match self {
-            Type::Primitive(p) => (p.name().to_owned(), String::new()),
-            Type::Struct(name) => (name.clone(), String::new()),
-            Type::Void => ("void".to_owned(), String::new()),
-            Type::Pointer(inner) => {
-                let (base, suffix) = inner.c_parts();
-                let base = if base.ends_with('*') {
-                    format!("{base}*")
-                } else {
-                    format!("{base} *")
-                };
-                (base, suffix)
-            }
-            Type::Array(inner, n) => {
-                let (base, suffix) = inner.c_parts();
-                (base, format!("[{n}]{suffix}"))
-            }
-        }
-    }
-}
-
+/// Rust syntax: `u32`, `*const Stats`, `[f32; 3]`, `*const c_void`.
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (base, suffix) = self.c_parts();
-        write!(f, "{base}{suffix}")
+        match self {
+            Type::Primitive(p) => f.write_str(p.name()),
+            Type::Pointer(inner) => write!(f, "*const {inner}"),
+            Type::Array(inner, n) => write!(f, "[{inner}; {n}]"),
+            Type::Struct(name) => f.write_str(name),
+            Type::Void => f.write_str("c_void"),
+        }
     }
 }
 
@@ -160,16 +143,15 @@ pub struct StructDef {
 /// Writes the definition back in the syntax it is parsed from.
 impl fmt::Display for StructDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "#[repr(C)]")?;
         writeln!(f, "struct {} {{", self.name)?;
         for field in &self.fields {
-            let (base, suffix) = field.ty.c_parts();
-            let sep = if base.ends_with('*') { "" } else { " " };
-            match field.offset {
-                Some(offset) => writeln!(f, "    {offset:#x}: {base}{sep}{}{suffix};", field.name)?,
-                None => writeln!(f, "    {base}{sep}{}{suffix};", field.name)?,
+            if let Some(offset) = field.offset {
+                writeln!(f, "    #[offset({offset:#x})]")?;
             }
+            writeln!(f, "    {}: {},", field.name, field.ty)?;
         }
-        write!(f, "}};")
+        write!(f, "}}")
     }
 }
 
@@ -196,7 +178,7 @@ pub enum LayoutError {
     Unknown(String),
     #[error("struct '{0}' contains itself")]
     Recursive(String),
-    #[error("'void' is only valid behind a pointer (field '{0}')")]
+    #[error("'c_void' is only valid behind a pointer (field '{0}')")]
     Void(String),
     #[error(
         "field '{field}' of '{name}' starts at {offset:#x}, before the end of the previous field ({end:#x})"
@@ -357,20 +339,23 @@ mod tests {
 
     const SOURCE: &str = "
         // A comment.
-        struct Stats { int armor; int mana; int health; };
-        struct Player {
-            unsigned int level;
-            char name[13];
-            struct Stats *stats;   /* pointer to another struct */
-            Stats inline_stats;
-            0x40: float position[3];
-            void *user_data;
-            bool alive;
-        };
+        struct Stats { armor: i32, mana: i32, health: i32 }
+
+        #[repr(C)]
+        pub struct Player {
+            pub level: u32,
+            name: [c_char; 13],
+            stats: *const Stats,   /* pointer to another struct */
+            inline_stats: Stats,
+            #[offset(0x40)]
+            position: [f32; 3],
+            user_data: *mut std::ffi::c_void,
+            alive: bool,
+        }
     ";
 
     #[test]
-    fn layout_follows_c_rules() {
+    fn layout_follows_repr_c() {
         let mut structs = Structs::new();
         assert_eq!(structs.define(SOURCE).unwrap(), ["Stats", "Player"]);
 
@@ -404,7 +389,7 @@ mod tests {
     fn layout_errors() {
         let mut structs = Structs::new();
         structs
-            .define("struct A { B b; }; struct B { A a; };")
+            .define("struct A { b: B } struct B { a: A }")
             .unwrap();
         assert!(matches!(
             structs.layout("A", 8),
@@ -415,7 +400,9 @@ mod tests {
             Err(LayoutError::Unknown(_))
         ));
 
-        structs.define("struct C { u64 a; 0x4: u32 b; };").unwrap();
+        structs
+            .define("struct C { a: u64, #[offset(4)] b: u32 }")
+            .unwrap();
         assert!(matches!(
             structs.layout("C", 8),
             Err(LayoutError::Overlap { .. })
@@ -423,7 +410,7 @@ mod tests {
 
         // A pointer to itself is fine.
         structs
-            .define("struct Node { Node *next; u32 value; };")
+            .define("struct Node { next: *mut Node, value: u32 }")
             .unwrap();
         assert_eq!(structs.layout("Node", 8).unwrap().size, 16);
     }
@@ -433,9 +420,10 @@ mod tests {
         let mut structs = Structs::new();
         structs.define(SOURCE).unwrap();
         let text = structs.to_string();
-        assert!(text.contains("    char name[13];"));
-        assert!(text.contains("    Stats *stats;"));
-        assert!(text.contains("    0x40: f32 position[3];"));
+        assert!(text.contains("    name: [c_char; 13],"));
+        assert!(text.contains("    stats: *const Stats,"));
+        assert!(text.contains("    #[offset(0x40)]\n    position: [f32; 3],"));
+        assert!(text.contains("    user_data: *const c_void,"));
 
         let mut again = Structs::new();
         again.define(&text).unwrap();

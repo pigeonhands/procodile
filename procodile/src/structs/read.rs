@@ -7,7 +7,7 @@ use crate::{Address, Error, ProcessHandle, Result};
 
 /// Arrays longer than this are cut short when read.
 const MAX_ARRAY_ITEMS: usize = 256;
-/// How much of a `char *` string is read.
+/// How much of a `*const c_char` string is read.
 const MAX_STRING: usize = 256;
 
 /// A value read from memory, shaped by its type.
@@ -25,7 +25,7 @@ pub enum Node {
         /// The declared length, which may be more than `items.len()`.
         len: usize,
     },
-    /// A `char` array or a followed `char *`, up to the first NUL.
+    /// A `[c_char; N]` or a followed `*const c_char`, up to the first NUL.
     String(String),
     Struct {
         name: String,
@@ -332,18 +332,29 @@ impl Guess {
 }
 
 /// Turns guesses into a definition with fields named after their offsets (`f_18`), as a
-/// starting point to rename and retype.
+/// starting point to rename and retype. Offsets are only spelled out where natural
+/// alignment would not put the field there anyway.
 pub fn guesses_to_struct(name: &str, guesses: &[Guess]) -> StructDef {
-    StructDef {
-        name: name.to_owned(),
-        fields: guesses
-            .iter()
-            .map(|g| FieldDef {
+    let mut end = 0usize;
+    let fields = guesses
+        .iter()
+        .map(|g| {
+            let align = match g.kind {
+                GuessKind::String(_) => 1,
+                _ => g.size,
+            };
+            let natural = end.next_multiple_of(align);
+            end = g.offset + g.size;
+            FieldDef {
                 name: format!("f_{:x}", g.offset),
                 ty: g.ty(),
-                offset: Some(g.offset),
-            })
-            .collect(),
+                offset: (g.offset != natural).then_some(g.offset),
+            }
+        })
+        .collect();
+    StructDef {
+        name: name.to_owned(),
+        fields,
     }
 }
 
@@ -369,15 +380,15 @@ mod tests {
     }
 
     const DEFS: &str = "
-        struct Stats { i32 armor; i32 mana; i32 health; };
+        struct Stats { armor: i32, mana: i32, health: i32 }
         struct Player {
-            u32 level;
-            char name[12];
-            Stats *stats;
-            f32 speed;
-            bool alive;
-            char *title;
-        };
+            level: u32,
+            name: [c_char; 12],
+            stats: *const Stats,
+            speed: f32,
+            alive: bool,
+            title: *const c_char,
+        }
     ";
 
     fn field<'a>(node: &'a Node, name: &str) -> &'a Node {
@@ -500,6 +511,7 @@ mod tests {
             ]
         );
         let def = guesses_to_struct("Unknown", &guesses);
+        assert!(def.fields.iter().all(|f| f.offset.is_none()), "{def}");
         let mut structs = Structs::new();
         structs.define(&def.to_string()).unwrap();
         assert_eq!(structs.layout("Unknown", 8).unwrap().size, bytes.len());

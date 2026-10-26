@@ -1,14 +1,16 @@
-//! Parser for the C-like definition syntax.
+//! Parser for the Rust-like definition syntax.
 //!
 //! ```text
-//! file   := (struct ';'?)*
-//! struct := 'struct' NAME '{' field* '}'
-//! field  := (NUMBER ':')? type declarator (',' declarator)* ';'
-//! type   := ('struct' | 'const' | 'volatile')* WORD+
-//! declarator := '*'* NAME ('[' NUMBER ']')*
+//! file   := item*
+//! item   := attr* vis? 'struct' NAME '{' (field (',' field)* ','?)? '}'
+//! field  := attr* vis? NAME ':' type
+//! type   := ('*const' | '*mut') type | '[' type ';' NUMBER ']' | '(' ')' | path
+//! path   := NAME ('::' NAME)*          // only the last segment counts
+//! attr   := '#' '[' ... ']'            // `#[offset(N)]` on a field; others are ignored
+//! vis    := 'pub' ('(' ... ')')?
 //! ```
 //!
-//! `//` and `/* */` comments are ignored.
+//! `//` and `/* */` comments are ignored, as are stray `;` between items.
 
 use super::{FieldDef, Primitive, StructDef, Type};
 
@@ -30,11 +32,13 @@ pub(super) fn parse(source: &str) -> Result<Vec<StructDef>, ParseError> {
     let tokens = tokenize(source)?;
     let mut p = Parser { tokens, pos: 0 };
     let mut defs = Vec::new();
-    while p.peek().is_some() {
-        defs.push(p.parse_struct()?);
+    loop {
         while p.eat_punct(';') {}
+        if p.peek().is_none() {
+            return Ok(defs);
+        }
+        defs.push(p.parse_struct()?);
     }
-    Ok(defs)
 }
 
 fn tokenize(source: &str) -> Result<Vec<(Token, usize)>, ParseError> {
@@ -80,15 +84,16 @@ fn tokenize(source: &str) -> Result<Vec<(Token, usize)>, ParseError> {
             c if c.is_ascii_digit() => {
                 let mut text = String::new();
                 while let Some(&(_, c)) = chars.peek() {
-                    if !c.is_ascii_alphanumeric() {
+                    if !(c.is_ascii_alphanumeric() || c == '_') {
                         break;
                     }
                     text.push(c);
                     chars.next();
                 }
-                let n = match text.strip_prefix("0x").or(text.strip_prefix("0X")) {
+                let digits = text.replace('_', "");
+                let n = match digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
                     Some(hex) => usize::from_str_radix(hex, 16),
-                    None => text.parse(),
+                    None => digits.parse(),
                 }
                 .map_err(|_| ParseError {
                     line,
@@ -96,7 +101,8 @@ fn tokenize(source: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                 })?;
                 tokens.push((Token::Number(n), line));
             }
-            '{' | '}' | ';' | '[' | ']' | '*' | ':' | ',' => {
+            '{' | '}' | '[' | ']' | '(' | ')' | ';' | ':' | ',' | '*' | '#' | '!' | '=' | '"'
+            | '<' | '>' | '&' => {
                 tokens.push((Token::Punct(c), line));
                 chars.next();
             }
@@ -152,6 +158,15 @@ impl Parser {
         }
     }
 
+    fn eat_word(&mut self, word: &str) -> bool {
+        if matches!(self.peek(), Some(Token::Word(w)) if w == word) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn word(&mut self) -> Option<String> {
         match self.peek() {
             Some(Token::Word(w)) => {
@@ -173,117 +188,154 @@ impl Parser {
         }
     }
 
+    /// Skips tokens up to the bracket matching an already-consumed `open`.
+    fn skip_group(&mut self, open: char, close: char) -> Result<(), ParseError> {
+        let mut depth = 1;
+        while depth > 0 {
+            match self.peek() {
+                None => return self.error(format!("missing '{close}'")),
+                Some(Token::Punct(c)) if *c == open => depth += 1,
+                Some(Token::Punct(c)) if *c == close => depth -= 1,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    /// Parses `#[...]` attributes, returning the value of an `#[offset(N)]`.
+    fn attributes(&mut self) -> Result<Option<usize>, ParseError> {
+        let mut offset = None;
+        while self.eat_punct('#') {
+            self.expect_punct('[')?;
+            if self.eat_word("offset") {
+                self.expect_punct('(')?;
+                offset = Some(self.number()?);
+                self.expect_punct(')')?;
+                self.expect_punct(']')?;
+            } else {
+                // `#[repr(C)]`, `#[derive(...)]`, doc comments as attributes, ...
+                self.skip_group('[', ']')?;
+            }
+        }
+        Ok(offset)
+    }
+
+    fn visibility(&mut self) -> Result<(), ParseError> {
+        if self.eat_word("pub") && self.eat_punct('(') {
+            self.skip_group('(', ')')?;
+        }
+        Ok(())
+    }
+
     fn parse_struct(&mut self) -> Result<StructDef, ParseError> {
-        if self.word().as_deref() != Some("struct") {
+        if self.attributes()?.is_some() {
+            return self.error("#[offset] goes on fields, not structs");
+        }
+        self.visibility()?;
+        if !self.eat_word("struct") {
             return self.error("expected 'struct'");
         }
         let Some(name) = self.word() else {
             return self.error("expected a struct name");
         };
+        if self.peek() == Some(&Token::Punct('<')) {
+            return self.error(format!("generic structs are not supported ({name})"));
+        }
         self.expect_punct('{')?;
+
         let mut fields: Vec<FieldDef> = Vec::new();
-        while !self.eat_punct('}') {
+        loop {
+            if self.eat_punct('}') {
+                break;
+            }
             if self.peek().is_none() {
                 return self.error(format!("missing '}}' for struct {name}"));
             }
-            for field in self.parse_fields()? {
-                if fields.iter().any(|f| f.name == field.name) {
-                    return self.error(format!("duplicate field '{}' in {name}", field.name));
-                }
-                fields.push(field);
+            let field = self.parse_field()?;
+            if fields.iter().any(|f| f.name == field.name) {
+                return self.error(format!("duplicate field '{}' in {name}", field.name));
+            }
+            fields.push(field);
+            if !self.eat_punct(',') {
+                self.expect_punct('}')?;
+                break;
             }
         }
         Ok(StructDef { name, fields })
     }
 
-    fn parse_fields(&mut self) -> Result<Vec<FieldDef>, ParseError> {
-        let offset = match self.peek() {
-            Some(Token::Number(_)) => {
-                let n = self.number()?;
-                self.expect_punct(':')?;
-                Some(n)
-            }
-            _ => None,
+    fn parse_field(&mut self) -> Result<FieldDef, ParseError> {
+        let offset = self.attributes()?;
+        self.visibility()?;
+        let Some(name) = self.word() else {
+            return self.error("expected a field name");
         };
-
-        // The type is every word before the first declarator. A declarator's name is the
-        // last word before `;`, `,` or `[`, so collect words and decide afterwards.
-        let mut words = Vec::new();
-        while let Some(w) = self.word() {
-            if !matches!(w.as_str(), "struct" | "const" | "volatile") {
-                words.push(w);
-            }
+        if !self.eat_punct(':') {
+            return self.error(format!("expected ':' after field name '{name}'"));
         }
-        let mut fields = Vec::new();
-        let mut first = true;
-        loop {
-            let mut stars = 0;
-            while self.eat_punct('*') {
-                stars += 1;
-            }
-            let name = if first && stars == 0 {
-                // `int x;`: the name was collected with the type words.
-                if words.len() < 2 {
-                    return self.error("expected a type and a field name");
-                }
-                words.pop().unwrap()
-            } else {
-                match self.word() {
-                    Some(name) => name,
-                    None => return self.error("expected a field name"),
-                }
-            };
-            if words.is_empty() {
-                return self.error(format!("missing type for field '{name}'"));
-            }
-
-            let mut ty = self.base_type(&words)?;
-            for _ in 0..stars {
-                ty = Type::Pointer(Box::new(ty));
-            }
-            let mut dims = Vec::new();
-            while self.eat_punct('[') {
-                dims.push(self.number()?);
-                self.expect_punct(']')?;
-            }
-            for &n in dims.iter().rev() {
-                ty = Type::Array(Box::new(ty), n);
-            }
-            if ty == Type::Void {
-                return self.error(format!(
-                    "field '{name}' cannot be void (did you mean void *?)"
-                ));
-            }
-            fields.push(FieldDef {
-                name,
-                ty,
-                // Only the first declarator can have the explicit offset.
-                offset: if first { offset } else { None },
-            });
-            first = false;
-            if self.eat_punct(',') {
-                continue;
-            }
-            self.expect_punct(';')?;
-            return Ok(fields);
+        let ty = self.parse_type()?;
+        if ty == Type::Void {
+            return self.error(format!(
+                "field '{name}' cannot be c_void (did you mean *const c_void?)"
+            ));
         }
+        Ok(FieldDef { name, ty, offset })
     }
 
-    fn base_type(&self, words: &[String]) -> Result<Type, ParseError> {
-        let joined = words.join(" ");
-        if let Some(p) = Primitive::from_name(&joined) {
+    fn parse_type(&mut self) -> Result<Type, ParseError> {
+        if self.eat_punct('*') {
+            if !(self.eat_word("const") || self.eat_word("mut")) {
+                return self.error("expected 'const' or 'mut' after '*'");
+            }
+            return Ok(Type::Pointer(Box::new(self.parse_type()?)));
+        }
+        if self.eat_punct('&') {
+            return self.error("references are not supported; use *const T");
+        }
+        if self.eat_punct('[') {
+            let inner = self.parse_type()?;
+            if !self.eat_punct(';') {
+                return self.error("slices are not supported; use [T; N]");
+            }
+            let n = self.number()?;
+            self.expect_punct(']')?;
+            return Ok(Type::Array(Box::new(inner), n));
+        }
+        if self.eat_punct('(') {
+            self.expect_punct(')')?;
+            return Ok(Type::Void);
+        }
+
+        // A path like `std::ffi::c_char`: only the last segment matters.
+        let Some(mut name) = self.word() else {
+            return self.error("expected a type");
+        };
+        while self.peek() == Some(&Token::Punct(':'))
+            && self.tokens.get(self.pos + 1).map(|(t, _)| t) == Some(&Token::Punct(':'))
+        {
+            self.pos += 2;
+            name = match self.word() {
+                Some(next) => next,
+                None => return self.error("expected a name after '::'"),
+            };
+        }
+        if self.peek() == Some(&Token::Punct('<')) {
+            return self.error(format!(
+                "generic types like {name}<...> are not supported; use *const T for Box/&"
+            ));
+        }
+        if let Some(p) = Primitive::from_name(&name) {
             return Ok(Type::Primitive(p));
         }
-        match words {
-            [w] if w == "void" => Ok(Type::Void),
-            [w] if w == "long" || w == "ulong" => {
-                self.error("'long' is 4 bytes on Windows and 8 on Linux; use i32/u32 or i64/u64")
-            }
-            [w] => Ok(Type::Struct(w.clone())),
-            _ if words.iter().any(|w| w == "long") => self.error(format!(
-                "'{joined}' differs between platforms; use a fixed-size type like u64"
+        match name.as_str() {
+            "c_void" => Ok(Type::Void),
+            "char" => self.error("Rust's char is 4 bytes; use c_char for text or u32"),
+            "c_long" | "c_ulong" => self.error(format!(
+                "{name} is 4 bytes on Windows and 8 on Linux; use i32/u32 or i64/u64"
             )),
-            _ => self.error(format!("unknown type '{joined}'")),
+            "i128" | "u128" => self.error(format!("{name} is not supported")),
+            _ => Ok(Type::Struct(name)),
         }
     }
 }
@@ -292,13 +344,17 @@ impl Parser {
 mod tests {
     use super::*;
 
-    fn field(source: &str) -> Result<Vec<FieldDef>, ParseError> {
+    fn fields(source: &str) -> Result<Vec<FieldDef>, ParseError> {
         parse(&format!("struct T {{ {source} }}")).map(|mut d| d.remove(0).fields)
     }
 
     #[test]
-    fn types_and_declarators() {
-        let f = field("unsigned int a, *b, c[2][3];").unwrap();
+    fn types() {
+        let f = fields(
+            "a: u32, b: *mut u32, c: [[u32; 3]; 2], d: *const *const Foo, e: *const (), \
+             g: std::ffi::c_char, #[offset(0x10)] pub h: [c_char; 4],",
+        )
+        .unwrap();
         let uint = Type::Primitive(Primitive::U32);
         assert_eq!(f[0].ty, uint);
         assert_eq!(f[1].ty, Type::Pointer(Box::new(uint.clone())));
@@ -306,29 +362,45 @@ mod tests {
             f[2].ty,
             Type::Array(Box::new(Type::Array(Box::new(uint), 3)), 2)
         );
-
-        let f = field("const struct Foo **pp; void *v; 0x10: char s[4];").unwrap();
         assert_eq!(
-            f[0].ty,
+            f[3].ty,
             Type::Pointer(Box::new(Type::Pointer(Box::new(Type::Struct(
                 "Foo".into()
             )))))
         );
-        assert_eq!(f[1].ty, Type::Pointer(Box::new(Type::Void)));
-        assert_eq!(f[2].offset, Some(0x10));
+        assert_eq!(f[4].ty, Type::Pointer(Box::new(Type::Void)));
+        assert_eq!(f[5].ty, Type::Primitive(Primitive::Char));
+        assert_eq!(f[6].offset, Some(0x10));
+    }
+
+    #[test]
+    fn items() {
+        let defs = parse(
+            "/// docs\n#[derive(Debug)]\n#[repr(C)]\npub(crate) struct A { x: u8 }\n\
+             struct B {}\n;\nstruct C { y: A }",
+        )
+        .unwrap();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["A", "B", "C"]);
     }
 
     #[test]
     fn errors_have_lines() {
-        let err = parse("struct A {\n  int x;\n  long y;\n};").unwrap_err();
+        let err = parse("struct A {\n  x: u32,\n  y: char,\n}").unwrap_err();
         assert_eq!(err.line, 3);
-        assert!(err.message.contains("long"));
+        assert!(err.message.contains("c_char"));
 
-        assert!(field("void v;").is_err());
-        assert!(field("int;").is_err());
-        assert!(field("int a; int a;").is_err());
-        assert!(parse("struct A { int x; ").is_err());
-        assert!(parse("struct A { int x; } /* open").is_err());
-        assert!(parse("union U { int x; };").is_err());
+        assert!(fields("v: c_void").is_err());
+        assert!(fields("x u32").is_err());
+        assert!(fields("x: u32 y: u32").is_err());
+        assert!(fields("a: u32, a: u32").is_err());
+        assert!(fields("p: *u32").is_err());
+        assert!(fields("s: &[u8]").is_err());
+        assert!(fields("v: Vec<u8>").is_err());
+        assert!(fields("n: c_long").is_err());
+        assert!(parse("struct A { x: u32, ").is_err());
+        assert!(parse("struct A { x: u32 } /* open").is_err());
+        assert!(parse("union U { x: u32 }").is_err());
+        assert!(parse("#[offset(4)] struct A {}").is_err());
     }
 }
