@@ -2,6 +2,12 @@
 name = "procodile"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-platform process memory primitives: regions, modules, value and pointer scanning, structs, freezing"
+readme = "../README.md"
+keywords = ["memory", "process", "scanner", "cheat-engine", "reverse-engineering"]
+categories = ["development-tools::debugging", "os"]
 
 [dependencies]
 thiserror = "2.0.18"

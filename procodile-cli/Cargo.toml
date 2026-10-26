@@ -2,6 +2,12 @@
 name = "procodile-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "An lldb-style REPL and TUI for scanning and editing process memory, built on procodile"
+readme = "../README.md"
+keywords = ["memory", "cheat-engine", "tui", "repl", "reverse-engineering"]
+categories = ["command-line-utilities", "development-tools::debugging"]
 
 [features]
 default = ["sqlite"]
@@ -11,7 +17,7 @@ sqlite = ["dep:rusqlite"]
 [dependencies]
 clap = { version = "4.5.58", features = ["derive"] }
 ctrlc = "3.5.2"
-procodile = { path = "../procodile" }
+procodile = { path = "../procodile", version = "0.2.0" }
 ratatui = "0.30.2"
 rusqlite = { version = "0.41.0", features = ["bundled"], optional = true }
 rustyline = "17.0.2"
