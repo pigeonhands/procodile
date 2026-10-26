@@ -32,8 +32,23 @@ impl Handle {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// The process's mappings, in address order.
+    ///
+    /// The kernel generates `maps` a page at a time, so if another thread maps or unmaps
+    /// memory while it is read, lines can come back repeated or out of order; sort and drop
+    /// overlaps so callers always see a consistent list.
     pub(crate) fn maps(&self) -> io::Result<Vec<MapsEntry>> {
         let contents = std::fs::read(format!("/proc/{}/maps", self.pid()))?;
-        Ok(maps::parse(&contents))
+        let mut entries = maps::parse(&contents);
+        entries.sort_by_key(|e| e.start);
+        let mut end = 0;
+        entries.retain(|e| {
+            let keep = e.start >= end;
+            if keep {
+                end = e.end;
+            }
+            keep
+        });
+        Ok(entries)
     }
 }
