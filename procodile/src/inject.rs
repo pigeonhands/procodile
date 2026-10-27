@@ -110,6 +110,16 @@ impl ProcessHandle {
         imp::execute_remote(self, entry, arg).map_err(Error::operation("execute remote"))
     }
 
+    /// Spawns a new thread in the target process at `entry` with `arg` and returns
+    /// immediately without waiting for it to finish.
+    ///
+    /// On Windows this creates a remote thread and closes the handle. On Linux it calls
+    /// `pthread_create` + `pthread_detach` in the target via ptrace (x86-64 only).
+    pub fn execute_remote_detached(&self, entry: Address, arg: u64) -> Result<()> {
+        imp::execute_remote_detached(self, entry, arg)
+            .map_err(Error::operation("execute remote detached"))
+    }
+
     fn load_via_loader(&self, path: &Path) -> Result<Module> {
         let before = self.modules().unwrap_or_default();
 

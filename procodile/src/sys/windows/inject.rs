@@ -147,6 +147,29 @@ pub(crate) fn execute_remote(
     Ok(exit_code as u64)
 }
 
+pub(crate) fn execute_remote_detached(
+    handle: &ProcessHandle,
+    entry: Address,
+    arg: u64,
+) -> io::Result<()> {
+    let thread = unsafe {
+        CreateRemoteThread(
+            handle.0.raw(),
+            std::ptr::null(),
+            0,
+            Some(std::mem::transmute(entry.get())),
+            arg as usize as *const _,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if thread.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(thread) };
+    Ok(())
+}
+
 fn call_remote_thread(handle: &ProcessHandle, ep: Address, arg: Address) -> io::Result<()> {
     let thread = unsafe {
         CreateRemoteThread(

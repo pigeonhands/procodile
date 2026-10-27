@@ -39,6 +39,17 @@ pub(crate) fn execute_remote(
     { let _ = (handle, entry, arg); Err(io::ErrorKind::Unsupported.into()) }
 }
 
+pub(crate) fn execute_remote_detached(
+    handle: &ProcessHandle,
+    entry: Address,
+    arg: u64,
+) -> io::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    { x86_64::execute_remote_detached_impl(handle, entry, arg) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = (handle, entry, arg); Err(io::ErrorKind::Unsupported.into()) }
+}
+
 #[cfg(feature = "inject")]
 pub(crate) fn map_image(
     handle: &ProcessHandle,
@@ -456,6 +467,69 @@ mod x86_64 {
         tracer.setregs(&saved)?;
         tracer.detach()?;
         Ok(result)
+    }
+
+    pub(super) fn execute_remote_detached_impl(
+        handle: &ProcessHandle,
+        entry: Address,
+        arg: u64,
+    ) -> io::Result<()> {
+        let pid = handle.as_inner().pid() as pid_t;
+        let mut tracer = PtraceGuard::attach(pid)?;
+        let saved = tracer.getregs()?;
+
+        // Two pages: first holds the pthread_t, second is remote_call scratch.
+        let alloc = remote_mmap(
+            handle, &tracer, &saved, 8192,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+        let tid_slot = alloc;
+        let scratch = alloc + 4096;
+
+        let pthread_create = resolve_pthread_sym(handle, "pthread_create")?;
+        let pthread_detach = resolve_pthread_sym(handle, "pthread_detach")?;
+
+        // pthread_create(&tid, NULL, start_routine, arg)
+        let args = [tid_slot, 0, entry.get() as u64, arg, 0, 0];
+        let ret = remote_call(handle, &tracer, &saved, scratch, pthread_create, &args)?;
+        if ret != 0 {
+            tracer.setregs(&saved)?;
+            tracer.detach()?;
+            return Err(io::Error::from_raw_os_error(ret as i32));
+        }
+
+        // Read back the pthread_t and detach the thread so its resources are
+        // freed on exit.
+        let mut tid_bytes = [0u8; 8];
+        handle.as_inner().mem.read_at(&mut tid_bytes, tid_slot)?;
+        let tid = u64::from_le_bytes(tid_bytes);
+
+        let args = [tid, 0, 0, 0, 0, 0];
+        remote_call(handle, &tracer, &saved, scratch, pthread_detach, &args)?;
+
+        tracer.setregs(&saved)?;
+        tracer.detach()?;
+        Ok(())
+    }
+
+    fn resolve_pthread_sym(handle: &ProcessHandle, name: &str) -> io::Result<u64> {
+        let target_maps = handle.as_inner().maps()?;
+        let candidates = ["/libpthread", "/libc.so", "/libc-"];
+        for pattern in &candidates {
+            if let Some(entry) = target_maps.iter().find(|e| {
+                e.path().is_some_and(|p| p.to_string_lossy().contains(pattern))
+            }) {
+                let base = entry.start as u64;
+                let path = entry.path().unwrap();
+                if let Ok(Some(offset)) = resolve_local_sym(&path, name) {
+                    return Ok(base + offset);
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{name} not found in target"),
+        ))
     }
 
     // ─── ELF manual mapping (requires `inject` feature / pewter) ─────────────

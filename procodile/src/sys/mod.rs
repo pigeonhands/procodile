@@ -17,6 +17,8 @@
 //!   Allocates RWX memory in the target and writes `data` into it.
 //! - `fn execute_remote(&ProcessHandle, Address, u64) -> io::Result<u64>` (in `inject`)
 //!   Runs code at an address in the target, passing one argument; returns the result.
+//! - `fn execute_remote_detached(&ProcessHandle, Address, u64) -> io::Result<()>` (in `inject`)
+//!   Spawns a thread in the target and returns without waiting.
 //!
 //! The facades in the crate root wrap these types one-to-one.
 
