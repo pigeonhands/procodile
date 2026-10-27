@@ -50,6 +50,9 @@ pub enum Error {
     #[error("invalid scan: {0}")]
     InvalidScan(String),
 
+    #[error("malformed image: {0}")]
+    MalformedImage(String),
+
     #[error("{0}")]
     InvalidType(String),
 
