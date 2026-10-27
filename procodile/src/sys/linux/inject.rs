@@ -27,6 +27,37 @@ pub(crate) fn load_library(handle: &ProcessHandle, path: &Path) -> io::Result<Ad
     }
 }
 
+/// Allocates RWX memory in the target and writes `data` into it.
+pub(crate) fn inject_bytes(handle: &ProcessHandle, data: &[u8]) -> io::Result<Address> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::inject_bytes_impl(handle, data)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (handle, data);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Runs code at `entry` in the target, passing `arg` as the first argument.
+/// Blocks until the code returns. Returns the return value (`rax`).
+pub(crate) fn execute_remote(
+    handle: &ProcessHandle,
+    entry: Address,
+    arg: u64,
+) -> io::Result<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::execute_remote_impl(handle, entry, arg)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (handle, entry, arg);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Maps an ELF shared-object image directly into the target without the OS loader.
 ///
 /// Returns `(base, mapped_size)` on success.
@@ -52,6 +83,7 @@ pub(crate) fn map_image(
 mod x86_64 {
     use std::io;
     use std::mem::MaybeUninit;
+    use std::os::unix::fs::FileExt;
     use std::path::Path;
 
     use libc::{
@@ -60,9 +92,6 @@ mod x86_64 {
     };
 
     use crate::{Address, ProcessHandle};
-    use crate::memory::Protection;
-    
-    
     use crate::AsInner;
 
     // ─── ptrace helpers ──────────────────────────────────────────────────────
@@ -78,7 +107,6 @@ mod x86_64 {
             if ret == -1 {
                 return Err(io::Error::last_os_error());
             }
-            // Wait for the process to stop.
             let mut status = 0i32;
             let ret = unsafe { waitpid(pid, &mut status, 0) };
             if ret == -1 {
@@ -131,7 +159,6 @@ mod x86_64 {
             if ret == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
         }
 
-        /// Continue and wait for the process to stop again (SIGTRAP / any signal).
         fn cont_and_wait(&self) -> io::Result<i32> {
             self.cont()?;
             self.wait()
@@ -162,10 +189,9 @@ mod x86_64 {
         }
     }
 
-    // ─── syscall injection ───────────────────────────────────────────────────
+    // ─── remote syscall injection ────────────────────────────────────────────
 
-    /// Find a `syscall` instruction (0f 05) in the target's libc rx mapping,
-    /// inject an `mmap` syscall, and return the resulting address.
+    /// Inject an `mmap` syscall into the target via ptrace, returning the mapped address.
     fn remote_mmap(
         handle: &ProcessHandle,
         tracer: &PtraceGuard,
@@ -173,20 +199,18 @@ mod x86_64 {
         size: usize,
         prot: i32,
     ) -> io::Result<u64> {
-        
-
         let syscall_addr = find_syscall_insn(handle)?;
 
-        // Build register state for mmap(NULL, size, prot, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0).
+        // mmap(NULL, size, prot, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
         let mut regs = *saved;
         regs.rip = syscall_addr;
         regs.rax = libc::SYS_mmap as u64;
-        regs.rdi = 0;                                  // addr = NULL
-        regs.rsi = size as u64;                        // length
-        regs.rdx = prot as u64;                        // prot
-        regs.r10 = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64; // flags
-        regs.r8 = u64::MAX;                            // fd = -1
-        regs.r9 = 0;                                   // offset
+        regs.rdi = 0;
+        regs.rsi = size as u64;
+        regs.rdx = prot as u64;
+        regs.r10 = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        regs.r8 = u64::MAX; // fd = -1
+        regs.r9 = 0;
 
         tracer.setregs(&regs)?;
         tracer.singlestep_and_wait()?;
@@ -194,29 +218,47 @@ mod x86_64 {
         let after = tracer.getregs()?;
         let mapped = after.rax;
         if mapped > u64::MAX - 0x1000 {
-            // mmap failed — rax holds a negative errno.
             return Err(io::Error::from_raw_os_error(-(mapped as i64) as i32));
         }
         Ok(mapped)
     }
 
-    /// Find the address of a `syscall` (0f 05) instruction in the target's libc
-    /// executable mapping.
-    fn find_syscall_insn(handle: &ProcessHandle) -> io::Result<u64> {
-        use std::os::unix::fs::FileExt;
+    /// Inject an `mprotect` syscall into the target via ptrace.
+    fn remote_mprotect(
+        handle: &ProcessHandle,
+        tracer: &PtraceGuard,
+        saved: &user_regs_struct,
+        addr: u64,
+        size: u64,
+        elf_flags: u32,
+    ) -> io::Result<()> {
+        let syscall_addr = find_syscall_insn(handle)?;
+        let prot = elf_flags_to_prot(elf_flags);
 
+        let mut regs = *saved;
+        regs.rip = syscall_addr;
+        regs.rax = libc::SYS_mprotect as u64;
+        regs.rdi = addr;
+        regs.rsi = size;
+        regs.rdx = prot as u64;
+
+        tracer.setregs(&regs)?;
+        tracer.singlestep_and_wait()?;
+        Ok(())
+    }
+
+    /// Find a `syscall` instruction (0f 05) in the target's libc executable mapping.
+    fn find_syscall_insn(handle: &ProcessHandle) -> io::Result<u64> {
         let maps = handle.as_inner().maps()?;
         let rx = maps
             .iter()
             .find(|e| {
-                e.protection.executable() && e.protection.readable()
-                    && e.path().map_or(false, |p| {
-                        p.to_string_lossy().contains("libc")
-                    })
+                e.protection.executable()
+                    && e.protection.readable()
+                    && e.path().map_or(false, |p| p.to_string_lossy().contains("libc"))
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no libc rx mapping"))?;
 
-        // Read up to 4 MiB of the mapping to find a syscall insn.
         let scan_len = (rx.end - rx.start).min(4 * 1024 * 1024);
         let mut buf = vec![0u8; scan_len];
         handle.as_inner().mem.read_at(&mut buf, rx.start as u64)?;
@@ -228,12 +270,59 @@ mod x86_64 {
         Err(io::Error::new(io::ErrorKind::NotFound, "syscall insn not found in libc"))
     }
 
+    fn elf_flags_to_prot(flags: u32) -> i32 {
+        let mut p = libc::PROT_NONE;
+        if flags & 4 != 0 { p |= libc::PROT_READ; }
+        if flags & 2 != 0 { p |= libc::PROT_WRITE; }
+        if flags & 1 != 0 { p |= libc::PROT_EXEC; }
+        p
+    }
+
+    // ─── remote function call via ptrace ─────────────────────────────────────
+
+    /// Call a function in the target at `fn_addr` with up to 6 integer arguments.
+    /// Places an INT3 return trap in `scratch`, sets up the call frame, and runs
+    /// until SIGTRAP. Returns `rax`.
+    fn remote_call(
+        handle: &ProcessHandle,
+        tracer: &PtraceGuard,
+        saved: &user_regs_struct,
+        scratch: u64,
+        fn_addr: u64,
+        args: &[u64; 6],
+    ) -> io::Result<u64> {
+        // Write INT3 near the end of the scratch page as the return address.
+        let ret_addr = scratch + 4096 - 16;
+        let trap: [u8; 1] = [0xcc];
+        handle.as_inner().mem.write_at(&trap, ret_addr)?;
+
+        let mut regs = *saved;
+        regs.rip = fn_addr;
+        regs.rdi = args[0];
+        regs.rsi = args[1];
+        regs.rdx = args[2];
+        regs.rcx = args[3];
+        regs.r8 = args[4];
+        regs.r9 = args[5];
+
+        // Stack: push the trap return address.
+        regs.rsp = ret_addr;
+        regs.rsp -= 8;
+        handle.as_inner().mem.write_at(&ret_addr.to_le_bytes(), regs.rsp)?;
+
+        tracer.setregs(&regs)?;
+        tracer.cont_and_wait()?;
+
+        let after = tracer.getregs()?;
+        Ok(after.rax)
+    }
+
     // ─── dlopen symbol resolution ────────────────────────────────────────────
 
-    /// Resolves the address of `__libc_dlopen_mode` in the target by locating libc's
-    /// base in both our own process and the target, then offsetting the local symbol.
+    /// Resolves `__libc_dlopen_mode` (or `dlopen`) in the target by finding libc's
+    /// base address in the target, then adding the symbol's file-relative vaddr read
+    /// from the on-disk ELF.
     fn resolve_dlopen(handle: &ProcessHandle) -> io::Result<u64> {
-        // Find libc in the target.
         let target_maps = handle.as_inner().maps()?;
         let target_libc = target_maps
             .iter()
@@ -249,72 +338,49 @@ mod x86_64 {
         let target_libc_base = target_libc.start as u64;
         let libc_path = target_libc.path().unwrap();
 
-        // Find libc in our own process to compute the local base.
-        let self_maps_raw = std::fs::read(format!("/proc/{}/maps", std::process::id()))?;
-        let self_maps = super::super::maps::parse(&self_maps_raw);
-        let self_libc = self_maps
-            .iter()
-            .find(|e| e.path().as_ref() == Some(&libc_path))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "same libc not loaded in injector process",
-                )
-            })?;
-        let self_libc_base = self_libc.start as u64;
-
-        // Resolve `__libc_dlopen_mode` in our own address space.
-        let sym_addr = resolve_local_sym(&libc_path, "__libc_dlopen_mode")?
+        // resolve_local_sym reads the ELF from disk; for ET_DYN shared libraries the
+        // st_value is already the offset from load-base 0, so the remote address is
+        // just target_base + st_value.
+        let offset = resolve_local_sym(&libc_path, "__libc_dlopen_mode")?
             .or_else(|| resolve_local_sym(&libc_path, "dlopen").ok().flatten())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "__libc_dlopen_mode not found")
+                io::Error::new(io::ErrorKind::NotFound, "dlopen symbol not found in libc")
             })?;
 
-        Ok(target_libc_base + (sym_addr - self_libc_base))
+        Ok(target_libc_base + offset)
     }
 
-    /// Resolve a symbol's virtual address in the given shared library by reading its
-    /// ELF dynamic symbol table directly.
+    /// Read the on-disk ELF at `lib_path` and return the `st_value` (file-relative
+    /// vaddr) of the named dynamic symbol, or `None` if not found.
     fn resolve_local_sym(
         lib_path: &std::path::Path,
         sym_name: &str,
     ) -> io::Result<Option<u64>> {
-        
-
         let data = std::fs::read(lib_path)?;
 
-        // Minimal ELF parser for dynamic symbol resolution.
-        if data.len() < 64 || &data[0..4] != b"\x7fELF" {
+        if data.len() < 64 || &data[0..4] != b"\x7fELF" || data[4] != 2 {
             return Ok(None);
         }
-        let is_64 = data[4] == 2;
-        if !is_64 {
-            return Ok(None); // 32-bit not supported in x86-64 path
-        }
-        let little = data[5] == 1;
+
         let read_u16 = |off: usize| -> u16 {
-            let b = &data[off..off+2];
-            if little { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }
+            u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
         };
         let read_u32 = |off: usize| -> u32 {
-            let b = &data[off..off+4];
-            if little { u32::from_le_bytes([b[0],b[1],b[2],b[3]]) } else { u32::from_be_bytes([b[0],b[1],b[2],b[3]]) }
+            u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
         };
         let read_u64 = |off: usize| -> u64 {
-            let b = &data[off..off+8];
-            if little { u64::from_le_bytes(b.try_into().unwrap()) } else { u64::from_be_bytes(b.try_into().unwrap()) }
+            u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
         };
 
         let shoff = read_u64(0x28) as usize;
         let shentsize = read_u16(0x3a) as usize;
         let shnum = read_u16(0x3c) as usize;
-        let _shstrndx = read_u16(0x3e) as usize;
 
         if shoff == 0 || shnum == 0 {
             return Ok(None);
         }
 
-        // Find .dynsym and .dynstr sections.
+        // Find .dynsym and its linked .dynstr.
         let mut dynsym_off = 0usize;
         let mut dynsym_size = 0usize;
         let mut dynstr_off = 0usize;
@@ -322,13 +388,11 @@ mod x86_64 {
         for i in 0..shnum {
             let base = shoff + i * shentsize;
             if base + shentsize > data.len() { break; }
-            let sh_type = read_u32(base + 0x4);
             // SHT_DYNSYM = 11
-            if sh_type == 11 {
+            if read_u32(base + 0x4) == 11 {
                 dynsym_off = read_u64(base + 0x18) as usize;
                 dynsym_size = read_u64(base + 0x20) as usize;
                 let link = read_u32(base + 0x28) as usize;
-                // linked section is .dynstr
                 if link < shnum {
                     let sbase = shoff + link * shentsize;
                     dynstr_off = read_u64(sbase + 0x18) as usize;
@@ -340,17 +404,17 @@ mod x86_64 {
             return Ok(None);
         }
 
-        // Elf64_Sym is 24 bytes.
-        let entsize = 24usize;
-        let count = dynsym_size / entsize;
+        let count = dynsym_size / 24; // Elf64_Sym = 24 bytes
         for i in 0..count {
-            let base = dynsym_off + i * entsize;
-            if base + entsize > data.len() { break; }
+            let base = dynsym_off + i * 24;
+            if base + 24 > data.len() { break; }
             let st_name = read_u32(base) as usize;
             let st_value = read_u64(base + 0x8);
             if st_value == 0 { continue; }
             let name_off = dynstr_off + st_name;
-            let name_end = data[name_off..].iter().position(|&b| b == 0)
+            let name_end = data[name_off..]
+                .iter()
+                .position(|&b| b == 0)
                 .map(|n| name_off + n)
                 .unwrap_or(data.len());
             if &data[name_off..name_end] == sym_name.as_bytes() {
@@ -360,59 +424,14 @@ mod x86_64 {
         Ok(None)
     }
 
-    // ─── remote function call via ptrace ─────────────────────────────────────
-
-    /// Call a function in the target at `fn_addr` with up to 6 integer arguments.
-    /// Sets up a trap-on-return by placing a 0xcc-padded return address, then runs
-    /// until SIGTRAP. Returns `rax`.
-    fn remote_call(
-        handle: &ProcessHandle,
-        tracer: &PtraceGuard,
-        saved: &user_regs_struct,
-        scratch: u64,
-        scratch_size: usize,
-        fn_addr: u64,
-        args: &[u64; 6],
-    ) -> io::Result<u64> {
-        use std::os::unix::fs::FileExt;
-
-        // Write INT3 at `scratch + scratch_size - 8` as the return address.
-        let ret_addr = scratch + scratch_size as u64 - 8;
-        let trap: [u8; 1] = [0xcc];
-        handle.as_inner().mem.write_at(&trap, ret_addr)?;
-
-        let mut regs = *saved;
-        regs.rip = fn_addr;
-        regs.rsp = ret_addr;      // "stack" pointer at the return address slot
-        regs.rdi = args[0];
-        regs.rsi = args[1];
-        regs.rdx = args[2];
-        regs.rcx = args[3];
-        regs.r8 = args[4];
-        regs.r9 = args[5];
-
-        // Push the trap return addr onto the stack.
-        regs.rsp -= 8;
-        handle.as_inner().mem.write_at(&ret_addr.to_le_bytes(), regs.rsp)?;
-
-        tracer.setregs(&regs)?;
-        tracer.cont_and_wait()?;
-
-        let after = tracer.getregs()?;
-        Ok(after.rax)
-    }
-
     // ─── dlopen injection entry ──────────────────────────────────────────────
 
     pub(super) fn dlopen_inject(handle: &ProcessHandle, path: &Path) -> io::Result<Address> {
-        use std::os::unix::fs::FileExt;
-
         let pid = handle.as_inner().pid() as pid_t;
         let mut tracer = PtraceGuard::attach(pid)?;
-
         let saved = tracer.getregs()?;
 
-        // Allocate scratch memory via a remote mmap syscall.
+        // Allocate a scratch page for the path string and the return-address trap.
         let path_bytes = {
             let s = path.as_os_str().as_encoded_bytes();
             let mut v = s.to_vec();
@@ -425,34 +444,29 @@ mod x86_64 {
             &tracer,
             &saved,
             scratch_size,
-            libc::PROT_READ | libc::PROT_WRITE,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         )?;
 
-        // Write the path into scratch memory.
+        // Write the library path into the scratch region.
         handle.as_inner().mem.write_at(&path_bytes, scratch)?;
 
-        // Resolve dlopen in the target.
         let dlopen_addr = resolve_dlopen(handle)?;
 
-        // Call __libc_dlopen_mode(path, RTLD_NOW=2).
+        // __libc_dlopen_mode(path, RTLD_NOW)
         let args = [scratch, libc::RTLD_NOW as u64, 0, 0, 0, 0];
-        let handle_val = remote_call(
-            handle, &tracer, &saved, scratch, scratch_size, dlopen_addr, &args,
-        )?;
+        let result = remote_call(handle, &tracer, &saved, scratch, dlopen_addr, &args)?;
 
-        // Restore original registers.
         tracer.setregs(&saved)?;
         tracer.detach()?;
 
-        if handle_val == 0 {
+        if result == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "dlopen returned NULL — library not found or symbol resolution failed",
             ));
         }
 
-        // Determine the module base by scanning the new mapping.
-        // The base is typically the lowest address of the new rx segment.
+        // Find the new mapping by path.
         let after_maps = handle.as_inner().maps()?;
         let lib_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
         let base = after_maps
@@ -465,20 +479,79 @@ mod x86_64 {
             .map(|e| e.start)
             .min()
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "new module not found in maps after dlopen")
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "new module not found in maps after dlopen",
+                )
             })?;
 
         Ok(Address::new(base))
     }
 
-    // ─── ELF manual mapping ──────────────────────────────────────────────────
+    // ─── low-level primitives ─────────────────────────────────────────────
+
+    pub(super) fn inject_bytes_impl(
+        handle: &ProcessHandle,
+        data: &[u8],
+    ) -> io::Result<Address> {
+        let pid = handle.as_inner().pid() as pid_t;
+        let mut tracer = PtraceGuard::attach(pid)?;
+        let saved = tracer.getregs()?;
+
+        let size = (data.len() + 0xfff) & !0xfff;
+        let addr = remote_mmap(
+            handle,
+            &tracer,
+            &saved,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+
+        handle.as_inner().mem.write_at(data, addr)?;
+
+        tracer.setregs(&saved)?;
+        tracer.detach()?;
+        Ok(Address::new(addr as usize))
+    }
+
+    pub(super) fn execute_remote_impl(
+        handle: &ProcessHandle,
+        entry: Address,
+        arg: u64,
+    ) -> io::Result<u64> {
+        let pid = handle.as_inner().pid() as pid_t;
+        let mut tracer = PtraceGuard::attach(pid)?;
+        let saved = tracer.getregs()?;
+
+        let scratch = remote_mmap(
+            handle,
+            &tracer,
+            &saved,
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+
+        let args = [arg, 0, 0, 0, 0, 0];
+        let result = remote_call(
+            handle,
+            &tracer,
+            &saved,
+            scratch,
+            entry.get() as u64,
+            &args,
+        )?;
+
+        tracer.setregs(&saved)?;
+        tracer.detach()?;
+        Ok(result)
+    }
+
+    // ─── ELF manual mapping ─────────────────────────────────────────────────
 
     pub(super) fn elf_map(
         handle: &ProcessHandle,
         image: &[u8],
     ) -> io::Result<(Address, usize)> {
-        
-
         parse_and_map_elf(handle, image)
     }
 
@@ -486,8 +559,6 @@ mod x86_64 {
         handle: &ProcessHandle,
         data: &[u8],
     ) -> io::Result<(Address, usize)> {
-        use std::os::unix::fs::FileExt;
-
         if data.len() < 64 || &data[0..4] != b"\x7fELF" {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ELF file"));
         }
@@ -496,26 +567,23 @@ mod x86_64 {
         }
 
         let read_u16 = |off: usize| -> u16 {
-            u16::from_le_bytes(data[off..off+2].try_into().unwrap())
+            u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
         };
         let read_u32 = |off: usize| -> u32 {
-            u32::from_le_bytes(data[off..off+4].try_into().unwrap())
+            u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
         };
         let read_u64 = |off: usize| -> u64 {
-            u64::from_le_bytes(data[off..off+8].try_into().unwrap())
+            u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
         };
 
-        // ELF header fields.
-        let e_type = read_u16(0x10);
         // ET_DYN = 3 (shared object / PIE)
-        if e_type != 3 {
+        if read_u16(0x10) != 3 {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "only ET_DYN ELF supported"));
         }
         let phoff = read_u64(0x20) as usize;
         let phentsize = read_u16(0x36) as usize;
         let phnum = read_u16(0x38) as usize;
 
-        // PT_LOAD segments determine the total mapped size.
         const PT_LOAD: u32 = 1;
         const PT_DYNAMIC: u32 = 2;
 
@@ -560,12 +628,11 @@ mod x86_64 {
         let total_size = (top_vaddr - base_vaddr) as usize;
         let aligned_size = (total_size + 0xfff) & !0xfff;
 
-        // Attach with ptrace to run remote syscalls.
         let pid = handle.as_inner().pid() as pid_t;
         let mut tracer = PtraceGuard::attach(pid)?;
         let saved = tracer.getregs()?;
 
-        // Reserve memory in the target.
+        // Allocate memory for the image in the target.
         let mapped_base = remote_mmap(
             handle,
             &tracer,
@@ -575,35 +642,42 @@ mod x86_64 {
         )?;
         let delta = mapped_base - base_vaddr;
 
-        // Write each PT_LOAD segment.
+        // Write each PT_LOAD segment's file-backed portion.
         for seg in &load_segs {
             if seg.filesz > 0 {
                 let src = &data[seg.offset..seg.offset + seg.filesz];
-                let dst = seg.vaddr + delta;
-                handle.as_inner().mem.write_at(src, dst)?;
+                handle.as_inner().mem.write_at(src, seg.vaddr + delta)?;
             }
         }
 
-        // Apply base relocations (RELA).
+        // Apply R_X86_64_RELATIVE relocations from SHT_RELA sections.
         apply_rela_relocations(handle, data, mapped_base, delta, &read_u16, &read_u32, &read_u64)?;
 
-        // Resolve and apply PLT/GOT imports from the dynamic segment.
+        // Resolve JUMP_SLOT / GLOB_DAT imports from the dynamic segment.
         if let Some(dv) = dyn_vaddr {
-            resolve_imports(handle, data, mapped_base, delta, dv, &read_u64)?;
+            resolve_imports(handle, data, delta, dv)?;
         }
 
-        // Protect segments with their correct permissions.
+        // Apply correct segment protections.
         for seg in &load_segs {
-            let addr = Address::new((seg.vaddr + delta) as usize);
-            let size = (seg.memsz + 0xfff) & !0xfff;
-            let _prot = elf_prot_to_protection(seg.flags);
-            // Best-effort: mprotect via a remote syscall.
-            let _ = remote_mprotect(handle, &tracer, &saved, addr.get() as u64, size as u64, seg.flags);
+            let addr = (seg.vaddr + delta) as u64;
+            let size = ((seg.memsz + 0xfff) & !0xfff) as u64;
+            let _ = remote_mprotect(handle, &tracer, &saved, addr, size, seg.flags);
         }
 
-        // Find and call DT_INIT and DT_INIT_ARRAY.
+        // Allocate a separate scratch page for init calls so we don't corrupt the
+        // mapped image.
+        let scratch = remote_mmap(
+            handle,
+            &tracer,
+            &saved,
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+
+        // Call DT_INIT and DT_INIT_ARRAY.
         if let Some(dv) = dyn_vaddr {
-            call_init(handle, &tracer, &saved, data, mapped_base, delta, dv, &read_u64)?;
+            call_init(handle, &tracer, &saved, data, delta, dv, scratch)?;
         }
 
         tracer.setregs(&saved)?;
@@ -612,49 +686,8 @@ mod x86_64 {
         Ok((Address::new(mapped_base as usize), aligned_size))
     }
 
-    fn remote_mprotect(
-        handle: &ProcessHandle,
-        tracer: &PtraceGuard,
-        saved: &user_regs_struct,
-        addr: u64,
-        size: u64,
-        elf_flags: u32,
-    ) -> io::Result<()> {
-        
+    // ─── RELA relocations ────────────────────────────────────────────────────
 
-        let syscall_addr = find_syscall_insn(handle)?;
-
-        let prot = elf_prot_to_libc(elf_flags);
-        let mut regs = *saved;
-        regs.rip = syscall_addr;
-        regs.rax = libc::SYS_mprotect as u64;
-        regs.rdi = addr;
-        regs.rsi = size;
-        regs.rdx = prot as u64;
-
-        tracer.setregs(&regs)?;
-        tracer.singlestep_and_wait()?;
-        tracer.setregs(saved)?;
-        Ok(())
-    }
-
-    fn elf_prot_to_libc(flags: u32) -> i32 {
-        let mut p = libc::PROT_NONE;
-        if flags & 4 != 0 { p |= libc::PROT_READ; }
-        if flags & 2 != 0 { p |= libc::PROT_WRITE; }
-        if flags & 1 != 0 { p |= libc::PROT_EXEC; }
-        p
-    }
-
-    fn elf_prot_to_protection(flags: u32) -> Protection {
-        let mut p = Protection::NONE;
-        if flags & 4 != 0 { p |= Protection::READ; }
-        if flags & 2 != 0 { p |= Protection::WRITE; }
-        if flags & 1 != 0 { p |= Protection::EXECUTE; }
-        p
-    }
-
-    // SHT_RELA = 4, SHT_REL = 9
     fn apply_rela_relocations(
         handle: &ProcessHandle,
         data: &[u8],
@@ -664,8 +697,6 @@ mod x86_64 {
         read_u32: &impl Fn(usize) -> u32,
         read_u64: &impl Fn(usize) -> u64,
     ) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-
         let shoff = read_u64(0x28) as usize;
         let shentsize = read_u16(0x3a) as usize;
         let shnum = read_u16(0x3c) as usize;
@@ -673,10 +704,8 @@ mod x86_64 {
         for i in 0..shnum {
             let base = shoff + i * shentsize;
             if base + shentsize > data.len() { break; }
-            let sh_type = read_u32(base + 0x4);
             // SHT_RELA = 4
-            if sh_type != 4 { continue; }
-            let _sh_addr = read_u64(base + 0x10);
+            if read_u32(base + 0x4) != 4 { continue; }
             let sh_offset = read_u64(base + 0x18) as usize;
             let sh_size = read_u64(base + 0x20) as usize;
             let sh_entsize = read_u64(base + 0x38) as usize;
@@ -690,7 +719,6 @@ mod x86_64 {
                 let r_info = read_u64(roff + 8);
                 let r_addend = read_u64(roff + 16) as i64;
                 let r_type = (r_info & 0xffffffff) as u32;
-                let _r_sym = (r_info >> 32) as u32;
 
                 // R_X86_64_RELATIVE = 8: value = base + addend
                 if r_type == 8 {
@@ -698,55 +726,45 @@ mod x86_64 {
                     let target_addr = r_offset + delta;
                     handle.as_inner().mem.write_at(&val.to_le_bytes(), target_addr)?;
                 }
-                // Other relocation types (GLOB_DAT, JUMP_SLOT) handled in resolve_imports.
+                // GLOB_DAT (6) and JUMP_SLOT (7) are handled in resolve_imports.
             }
         }
         Ok(())
     }
 
+    // ─── dynamic import resolution ───────────────────────────────────────────
+
     fn resolve_imports(
         handle: &ProcessHandle,
         data: &[u8],
-        _mapped_base: u64,
         delta: u64,
         dyn_vaddr: u64,
-        read_u64: &impl Fn(usize) -> u64,
     ) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-
-        // Parse the PT_DYNAMIC segment to find DT_JMPREL, DT_PLTRELSZ, DT_STRTAB, DT_SYMTAB.
         const DT_NULL: u64 = 0;
         const DT_STRTAB: u64 = 5;
         const DT_SYMTAB: u64 = 6;
         const DT_JMPREL: u64 = 23;
         const DT_PLTRELSZ: u64 = 2;
-        const DT_RELA: u64 = 7;
-        const DT_RELASZ: u64 = 8;
 
-        // dyn_vaddr is the vaddr of PT_DYNAMIC in the file; compute its offset.
-        // We need to find its offset by matching vaddr in PT_LOAD.
-        let _shoff = read_u64(0x28) as usize;
-        // Use the mapped segment approach — find the dynheader in data by vaddr.
         let phoff = u64::from_le_bytes(data[0x20..0x28].try_into().unwrap()) as usize;
         let phentsize = u16::from_le_bytes(data[0x36..0x38].try_into().unwrap()) as usize;
         let phnum = u16::from_le_bytes(data[0x38..0x3a].try_into().unwrap()) as usize;
 
-        // Find the file offset of dyn_vaddr via PT_LOAD mappings.
         let dyn_file_off = vaddr_to_file_off(data, dyn_vaddr, phoff, phentsize, phnum)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "PT_DYNAMIC not in any PT_LOAD"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "PT_DYNAMIC not in any PT_LOAD")
+            })?;
 
         let mut strtab_vaddr = None;
         let mut symtab_vaddr = None;
         let mut jmprel_vaddr = None;
         let mut jmprel_sz = 0u64;
-        let mut rela_vaddr = None;
-        let mut rela_sz = 0u64;
 
         let mut off = dyn_file_off;
         loop {
             if off + 16 > data.len() { break; }
-            let d_tag = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-            let d_val = u64::from_le_bytes(data[off+8..off+16].try_into().unwrap());
+            let d_tag = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            let d_val = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
             off += 16;
             match d_tag {
                 DT_NULL => break,
@@ -754,47 +772,54 @@ mod x86_64 {
                 DT_SYMTAB => symtab_vaddr = Some(d_val),
                 DT_JMPREL => jmprel_vaddr = Some(d_val),
                 DT_PLTRELSZ => jmprel_sz = d_val,
-                DT_RELA => rela_vaddr = Some(d_val),
-                DT_RELASZ => rela_sz = d_val,
                 _ => {}
             }
         }
 
-        // Apply JMPREL (PLT) relocations.
-        if let (Some(jrel), Some(strtab), Some(symtab)) = (jmprel_vaddr, strtab_vaddr, symtab_vaddr) {
+        if let (Some(jrel), Some(strtab), Some(symtab)) =
+            (jmprel_vaddr, strtab_vaddr, symtab_vaddr)
+        {
             let jrel_off = vaddr_to_file_off(data, jrel, phoff, phentsize, phnum);
             let strtab_off = vaddr_to_file_off(data, strtab, phoff, phentsize, phnum);
             let symtab_off = vaddr_to_file_off(data, symtab, phoff, phentsize, phnum);
 
-            if let (Some(jrel_off), Some(strtab_off), Some(symtab_off)) = (jrel_off, strtab_off, symtab_off) {
-                let count = jmprel_sz as usize / 24; // Elf64_Rela = 24 bytes
+            if let (Some(jrel_off), Some(strtab_off), Some(symtab_off)) =
+                (jrel_off, strtab_off, symtab_off)
+            {
+                let count = jmprel_sz as usize / 24;
                 for i in 0..count {
                     let roff = jrel_off + i * 24;
                     if roff + 24 > data.len() { break; }
-                    let r_offset = u64::from_le_bytes(data[roff..roff+8].try_into().unwrap());
-                    let r_info = u64::from_le_bytes(data[roff+8..roff+16].try_into().unwrap());
-                    let _r_addend = i64::from_le_bytes(data[roff+16..roff+24].try_into().unwrap());
+                    let r_offset =
+                        u64::from_le_bytes(data[roff..roff + 8].try_into().unwrap());
+                    let r_info =
+                        u64::from_le_bytes(data[roff + 8..roff + 16].try_into().unwrap());
                     let r_sym = (r_info >> 32) as usize;
                     let r_type = (r_info & 0xffffffff) as u32;
 
-                    // R_X86_64_JUMP_SLOT = 7, R_X86_64_GLOB_DAT = 6
-                    if r_type != 7 && r_type != 6 { continue; }
+                    // R_X86_64_GLOB_DAT = 6, R_X86_64_JUMP_SLOT = 7
+                    if r_type != 6 && r_type != 7 { continue; }
 
-                    // Get symbol name from dynsym.
-                    let sym_off = symtab_off + r_sym * 24; // Elf64_Sym = 24 bytes
+                    let sym_off = symtab_off + r_sym * 24;
                     if sym_off + 4 > data.len() { continue; }
-                    let st_name = u32::from_le_bytes(data[sym_off..sym_off+4].try_into().unwrap()) as usize;
+                    let st_name =
+                        u32::from_le_bytes(data[sym_off..sym_off + 4].try_into().unwrap())
+                            as usize;
                     let name_off = strtab_off + st_name;
-                    let name_end = data[name_off..].iter().position(|&b| b == 0)
+                    let name_end = data[name_off..]
+                        .iter()
+                        .position(|&b| b == 0)
                         .map(|n| name_off + n)
                         .unwrap_or(data.len());
-                    let sym_name = std::str::from_utf8(&data[name_off..name_end])
-                        .unwrap_or("");
+                    let sym_name =
+                        std::str::from_utf8(&data[name_off..name_end]).unwrap_or("");
 
-                    // Find the symbol in the target's loaded modules.
                     if let Some(sym_addr) = find_export_in_target(handle, sym_name) {
                         let target_addr = r_offset + delta;
-                        handle.as_inner().mem.write_at(&sym_addr.to_le_bytes(), target_addr)?;
+                        handle
+                            .as_inner()
+                            .mem
+                            .write_at(&sym_addr.to_le_bytes(), target_addr)?;
                     }
                 }
             }
@@ -813,11 +838,11 @@ mod x86_64 {
         for i in 0..phnum {
             let base = phoff + i * phentsize;
             if base + phentsize > data.len() { break; }
-            let p_type = u32::from_le_bytes(data[base..base+4].try_into().unwrap());
+            let p_type = u32::from_le_bytes(data[base..base + 4].try_into().unwrap());
             if p_type != 1 { continue; } // PT_LOAD
-            let p_offset = u64::from_le_bytes(data[base+0x8..base+0x10].try_into().unwrap());
-            let p_vaddr = u64::from_le_bytes(data[base+0x10..base+0x18].try_into().unwrap());
-            let p_filesz = u64::from_le_bytes(data[base+0x20..base+0x28].try_into().unwrap());
+            let p_offset = u64::from_le_bytes(data[base + 0x8..base + 0x10].try_into().unwrap());
+            let p_vaddr = u64::from_le_bytes(data[base + 0x10..base + 0x18].try_into().unwrap());
+            let p_filesz = u64::from_le_bytes(data[base + 0x20..base + 0x28].try_into().unwrap());
             if vaddr >= p_vaddr && vaddr < p_vaddr + p_filesz {
                 return Some((vaddr - p_vaddr + p_offset) as usize);
             }
@@ -825,36 +850,31 @@ mod x86_64 {
         None
     }
 
-    /// Look up an exported symbol by name in the target's loaded modules by reading their
-    /// ELF export tables out of the target process memory.
+    /// Look up an exported symbol in the target's loaded modules by reading their
+    /// on-disk ELF dynsym tables and sliding by the actual load address.
     fn find_export_in_target(handle: &ProcessHandle, sym_name: &str) -> Option<u64> {
-        
-
         let maps = handle.as_inner().maps().ok()?;
-        // For each mapped file, try to find sym_name in its .dynsym.
         let mut seen_paths: std::collections::HashSet<String> = Default::default();
         for entry in &maps {
             let path = entry.path()?;
             let path_s = path.to_string_lossy().into_owned();
             if !seen_paths.insert(path_s.clone()) { continue; }
-            if path_s.starts_with('[') { continue; } // [stack], [heap], etc.
+            if path_s.starts_with('[') { continue; }
 
-            // Read the target module's ELF from disk (same file, same symbols).
-            let Ok(module_data) = std::fs::read(path) else { continue };
+            let Ok(module_data) = std::fs::read(&path) else { continue };
             if module_data.len() < 64 || &module_data[0..4] != b"\x7fELF" { continue; }
 
-            // Find .dynsym in module_data.
             let read_u16 = |off: usize| -> u16 {
-                u16::from_le_bytes(module_data[off..off+2].try_into().unwrap())
+                u16::from_le_bytes(module_data[off..off + 2].try_into().unwrap())
             };
             let read_u32 = |off: usize| -> u32 {
-                u32::from_le_bytes(module_data[off..off+4].try_into().unwrap())
+                u32::from_le_bytes(module_data[off..off + 4].try_into().unwrap())
             };
-            let read_u64 = |off: usize| -> u64 {
-                u64::from_le_bytes(module_data[off..off+8].try_into().unwrap())
+            let read_u64m = |off: usize| -> u64 {
+                u64::from_le_bytes(module_data[off..off + 8].try_into().unwrap())
             };
 
-            let shoff = read_u64(0x28) as usize;
+            let shoff = read_u64m(0x28) as usize;
             let shentsize = read_u16(0x3a) as usize;
             let shnum = read_u16(0x3c) as usize;
             if shoff == 0 { continue; }
@@ -866,14 +886,13 @@ mod x86_64 {
             for i in 0..shnum {
                 let base = shoff + i * shentsize;
                 if base + shentsize > module_data.len() { break; }
-                let sh_type = read_u32(base + 0x4);
-                if sh_type == 11 { // SHT_DYNSYM
-                    dynsym_off = read_u64(base + 0x18) as usize;
-                    dynsym_size = read_u64(base + 0x20) as usize;
+                if read_u32(base + 0x4) == 11 {
+                    dynsym_off = read_u64m(base + 0x18) as usize;
+                    dynsym_size = read_u64m(base + 0x20) as usize;
                     let link = read_u32(base + 0x28) as usize;
                     if link < shnum {
                         let sbase = shoff + link * shentsize;
-                        dynstr_off = read_u64(sbase + 0x18) as usize;
+                        dynstr_off = read_u64m(sbase + 0x18) as usize;
                     }
                 }
             }
@@ -884,74 +903,69 @@ mod x86_64 {
                 let sym_base = dynsym_off + i * 24;
                 if sym_base + 24 > module_data.len() { break; }
                 let st_name = read_u32(sym_base) as usize;
-                let st_value = read_u64(sym_base + 0x8);
+                let st_value = read_u64m(sym_base + 0x8);
                 if st_value == 0 { continue; }
                 let name_off = dynstr_off + st_name;
-                let name_end = module_data[name_off..].iter().position(|&b| b == 0)
+                let name_end = module_data[name_off..]
+                    .iter()
+                    .position(|&b| b == 0)
                     .map(|n| name_off + n)
                     .unwrap_or(module_data.len());
                 if &module_data[name_off..name_end] == sym_name.as_bytes() {
-                    // st_value is the file-relative vaddr; add the module's base.
-                    let base = entry.start as u64;
-                    // Find the PT_LOAD base vaddr to compute the slide.
-                    let phoff = read_u64(0x20) as usize;
+                    // Compute the module's load slide: runtime base - file base.
+                    let runtime_base = entry.start as u64;
+                    let phoff = read_u64m(0x20) as usize;
                     let phentsize = read_u16(0x36) as usize;
                     let phnum = read_u16(0x38) as usize;
-                    let load_base_vaddr = (0..phnum)
+                    let file_base_vaddr = (0..phnum)
                         .filter_map(|j| {
                             let b = phoff + j * phentsize;
                             if b + phentsize > module_data.len() { return None; }
-                            let p_type = read_u32(b);
-                            if p_type != 1 { return None; }
-                            Some(read_u64(b + 0x10))
+                            if read_u32(b) != 1 { return None; } // PT_LOAD
+                            Some(read_u64m(b + 0x10))
                         })
                         .min()
                         .unwrap_or(0);
-                    let slide = base - load_base_vaddr;
-                    return Some(st_value + slide);
+                    return Some(st_value + runtime_base - file_base_vaddr);
                 }
             }
         }
         None
     }
 
+    // ─── init functions ──────────────────────────────────────────────────────
+
     fn call_init(
         handle: &ProcessHandle,
         tracer: &PtraceGuard,
         saved: &user_regs_struct,
         data: &[u8],
-        mapped_base: u64,
         delta: u64,
         dyn_vaddr: u64,
-        _read_u64: &impl Fn(usize) -> u64,
+        scratch: u64,
     ) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-
+        const DT_NULL: u64 = 0;
         const DT_INIT: u64 = 12;
         const DT_INIT_ARRAY: u64 = 25;
         const DT_INIT_ARRAYSZ: u64 = 27;
-        const DT_NULL: u64 = 0;
 
         let phoff = u64::from_le_bytes(data[0x20..0x28].try_into().unwrap()) as usize;
         let phentsize = u16::from_le_bytes(data[0x36..0x38].try_into().unwrap()) as usize;
         let phnum = u16::from_le_bytes(data[0x38..0x3a].try_into().unwrap()) as usize;
 
-        let dyn_off = vaddr_to_file_off(data, dyn_vaddr, phoff, phentsize, phnum);
-        let Some(dyn_off) = dyn_off else { return Ok(()); };
+        let Some(dyn_off) = vaddr_to_file_off(data, dyn_vaddr, phoff, phentsize, phnum) else {
+            return Ok(());
+        };
 
-        // Allocate a small scratch area for call set-up (reuse an already-mapped region
-        // by picking any RW area with enough room — we use the mapped image memory at
-        // mapped_base + offset for the return-address trap slot).
-        let scratch = mapped_base; // first page of mapped image suffices for the trap slot
-
-        let mut off = dyn_off;
         let mut init_fn: Option<u64> = None;
         let mut init_array: Option<u64> = None;
         let mut init_arraysz: u64 = 0;
+
+        let mut off = dyn_off;
         loop {
             if off + 16 > data.len() { break; }
-            let d_tag = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-            let d_val = u64::from_le_bytes(data[off+8..off+16].try_into().unwrap());
+            let d_tag = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            let d_val = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
             off += 16;
             match d_tag {
                 DT_NULL => break,
@@ -964,7 +978,7 @@ mod x86_64 {
 
         let call = |fn_addr: u64| -> io::Result<()> {
             let args = [0u64; 6];
-            remote_call(handle, tracer, saved, scratch, 4096, fn_addr, &args)?;
+            remote_call(handle, tracer, saved, scratch, fn_addr, &args)?;
             Ok(())
         };
 

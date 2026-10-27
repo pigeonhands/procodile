@@ -13,17 +13,14 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows_sys::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, INFINITE, WaitForSingleObject,
 };
 
-use super::process::Handle;
 use crate::memory::Protection;
 use crate::{Address, ProcessHandle};
-use crate::AsInner;
 
 /// Loads a shared library into the target via `LoadLibraryW` / `CreateRemoteThread`.
 ///
@@ -121,6 +118,52 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
     wide
 }
 
+/// Allocates RWX memory in the target and writes `data` into it.
+pub(crate) fn inject_bytes(handle: &ProcessHandle, data: &[u8]) -> io::Result<Address> {
+    let size = (data.len() + 0xfff) & !0xfff;
+    let addr = handle.0.allocate(size, Protection::READ_WRITE)?;
+    handle.0.write_at(addr, data).map_err(|e| {
+        let _ = handle.0.free(addr);
+        e
+    })?;
+    let _ = handle.0.protect(addr, size, Protection::READ_WRITE | Protection::EXECUTE);
+    Ok(addr)
+}
+
+/// Runs code at `entry` in the target, passing `arg` as the first argument.
+/// Blocks until the thread finishes. Returns the thread exit code.
+pub(crate) fn execute_remote(
+    handle: &ProcessHandle,
+    entry: Address,
+    arg: u64,
+) -> io::Result<u64> {
+    let thread = unsafe {
+        CreateRemoteThread(
+            handle.0.raw(),
+            std::ptr::null(),
+            0,
+            Some(std::mem::transmute(entry.get())),
+            arg as usize as *const _,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if thread.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let wait = unsafe { WaitForSingleObject(thread, INFINITE) };
+    let mut exit_code: u32 = 0;
+    let get_ok = unsafe { GetExitCodeThread(thread, &mut exit_code) };
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(thread) };
+    if wait != WAIT_OBJECT_0 {
+        return Err(io::Error::last_os_error());
+    }
+    if get_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(exit_code as u64)
+}
+
 /// Maps a PE image directly into the target without the OS loader.
 ///
 /// Returns `(base, mapped_size)`.
@@ -168,12 +211,13 @@ fn parse_and_map_pe(handle: &ProcessHandle, data: &[u8]) -> io::Result<(Address,
     let size_of_image = u32::from_le_bytes(data[opt_off + 56..opt_off + 60].try_into().unwrap()) as usize;
     let size_of_headers = u32::from_le_bytes(data[opt_off + 60..opt_off + 64].try_into().unwrap()) as usize;
 
-    // Data directories (starts at opt_off + 112 for PE32+).
+    // Data directories (starts at opt_off + 112 for PE32+; each entry is 8 bytes).
+    // Entry 0 = Export, 1 = Import, 5 = Base Relocation, 9 = TLS.
     let dd_off = opt_off + 112;
-    let reloc_rva = u32::from_le_bytes(data[dd_off + 8..dd_off + 12].try_into().unwrap()) as usize;
-    let reloc_sz = u32::from_le_bytes(data[dd_off + 12..dd_off + 16].try_into().unwrap()) as usize;
-    let import_rva = u32::from_le_bytes(data[dd_off..dd_off + 4].try_into().unwrap()) as usize;
-    let import_sz = u32::from_le_bytes(data[dd_off + 4..dd_off + 8].try_into().unwrap()) as usize;
+    let import_rva = u32::from_le_bytes(data[dd_off + 8..dd_off + 12].try_into().unwrap()) as usize;
+    let import_sz = u32::from_le_bytes(data[dd_off + 12..dd_off + 16].try_into().unwrap()) as usize;
+    let reloc_rva = u32::from_le_bytes(data[dd_off + 40..dd_off + 44].try_into().unwrap()) as usize;
+    let reloc_sz = u32::from_le_bytes(data[dd_off + 44..dd_off + 48].try_into().unwrap()) as usize;
     let tls_rva = u32::from_le_bytes(data[dd_off + 72..dd_off + 76].try_into().unwrap()) as usize;
 
     // ── Allocate memory in the target ────────────────────────────────────────
@@ -199,7 +243,7 @@ fn parse_and_map_pe(handle: &ProcessHandle, data: &[u8]) -> io::Result<(Address,
         if s + 40 > data.len() { break; }
         sections.push(Section {
             virtual_address: u32::from_le_bytes(data[s + 12..s + 16].try_into().unwrap()) as usize,
-            virtual_size: u32::from_le_bytes(data[s + 16..s + 20].try_into().unwrap()) as usize,
+            virtual_size: u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()) as usize,
             raw_offset: u32::from_le_bytes(data[s + 20..s + 24].try_into().unwrap()) as usize,
             raw_size: u32::from_le_bytes(data[s + 16..s + 20].try_into().unwrap()) as usize,
             characteristics: u32::from_le_bytes(data[s + 36..s + 40].try_into().unwrap()),
@@ -301,6 +345,7 @@ fn resolve_imports(
     import_rva: usize,
 ) -> io::Result<()> {
     let mut desc_off = rva_to_file_offset(data, import_rva)?;
+    let modules = handle.modules().unwrap_or_default();
 
     loop {
         if desc_off + 20 > data.len() { break; }
@@ -318,8 +363,6 @@ fn resolve_imports(
         let dll_name = std::str::from_utf8(&data[name_off..name_end])
             .unwrap_or("");
 
-        // Find the DLL in the target's module list.
-        let modules = handle.modules().unwrap_or_default();
         let dll_module = modules.iter().find(|m| {
             m.name.to_string_lossy().eq_ignore_ascii_case(dll_name)
         });
@@ -366,7 +409,8 @@ fn resolve_imports(
 
 /// Resolve an export by name from a module already loaded in the target.
 fn find_export_by_name(handle: &ProcessHandle, mod_base: Address, sym_name: &str) -> Option<usize> {
-    let (names, funcs, ordinals, base) = read_export_table(handle, mod_base)?;
+    let (names, funcs, ordinals, ordinal_base, base) = read_export_table(handle, mod_base)?;
+    let _ = ordinal_base;
     for (i, &name_rva) in names.iter().enumerate() {
         let name = read_target_string(handle, Address::new(base + name_rva as usize))?;
         if name == sym_name {
@@ -379,15 +423,16 @@ fn find_export_by_name(handle: &ProcessHandle, mod_base: Address, sym_name: &str
 }
 
 fn find_export_by_ordinal(handle: &ProcessHandle, mod_base: Address, ordinal: u16) -> Option<usize> {
-    let (_, funcs, _, base) = read_export_table(handle, mod_base)?;
-    let fn_rva = funcs[ordinal as usize] as usize;
+    let (_, funcs, _, ordinal_base, base) = read_export_table(handle, mod_base)?;
+    let index = (ordinal as usize).checked_sub(ordinal_base as usize)?;
+    let fn_rva = *funcs.get(index)? as usize;
     Some(base + fn_rva)
 }
 
 fn read_export_table(
     handle: &ProcessHandle,
     mod_base: Address,
-) -> Option<(Vec<u32>, Vec<u32>, Vec<u16>, usize)> {
+) -> Option<(Vec<u32>, Vec<u32>, Vec<u16>, u32, usize)> {
     // Read the PE headers from the target to find the export directory.
     let mut hdr = vec![0u8; 0x400];
     handle.0.read_at(mod_base, &mut hdr).ok()?;
@@ -398,13 +443,13 @@ fn read_export_table(
     let dd_off = opt_off + 112;
     if dd_off + 8 > hdr.len() { return None; }
     let export_rva = u32::from_le_bytes(hdr[dd_off..dd_off + 4].try_into().ok()?) as usize;
-    let export_sz = u32::from_le_bytes(hdr[dd_off + 4..dd_off + 8].try_into().ok()?) as usize;
     if export_rva == 0 { return None; }
 
     let export_dir_addr = Address::new(mod_base.get() + export_rva);
     let mut dir = vec![0u8; 40];
     handle.0.read_at(export_dir_addr, &mut dir).ok()?;
 
+    let ordinal_base = u32::from_le_bytes(dir[16..20].try_into().ok()?);
     let num_funcs = u32::from_le_bytes(dir[20..24].try_into().ok()?) as usize;
     let num_names = u32::from_le_bytes(dir[24..28].try_into().ok()?) as usize;
     let funcs_rva = u32::from_le_bytes(dir[28..32].try_into().ok()?) as usize;
@@ -431,7 +476,7 @@ fn read_export_table(
         .map(|i| u16::from_le_bytes(ords_raw[i * 2..i * 2 + 2].try_into().unwrap()))
         .collect();
 
-    Some((names, funcs, ordinals, mod_base.get()))
+    Some((names, funcs, ordinals, ordinal_base, mod_base.get()))
 }
 
 fn read_target_string(handle: &ProcessHandle, addr: Address) -> Option<String> {
