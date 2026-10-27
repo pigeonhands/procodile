@@ -13,6 +13,10 @@
 //! - `impl Handle { map_image(&[u8]) -> io::Result<(Address, usize)> }` (in `inject`)
 //!   Maps a shared library image directly into the target without the OS loader, returning
 //!   `(base, mapped_size)`. x86-64 only in the first pass.
+//! - `fn inject_bytes(&ProcessHandle, &[u8]) -> io::Result<Address>` (in `inject`)
+//!   Allocates RWX memory in the target and writes `data` into it.
+//! - `fn execute_remote(&ProcessHandle, Address, u64) -> io::Result<u64>` (in `inject`)
+//!   Runs code at an address in the target, passing one argument; returns the result.
 //!
 //! The facades in the crate root wrap these types one-to-one.
 

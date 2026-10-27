@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::sys::inject as imp;
-use crate::{Error, Module, ProcessHandle, Result};
+use crate::{Address, Error, Module, ProcessHandle, Result};
 
 /// How a shared library is loaded into the target process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -73,6 +73,25 @@ impl ProcessHandle {
     /// x86-64 only in the current implementation.
     pub fn map_image(&self, image: &[u8]) -> Result<Module> {
         self.map_image_bytes(image, None)
+    }
+
+    /// Allocates executable memory in the target and writes `data` into it, returning
+    /// the base address of the new allocation.
+    ///
+    /// This is a low-level primitive — for loading a full shared library, use
+    /// [`load_library`](ProcessHandle::load_library) or [`map_image`](ProcessHandle::map_image).
+    pub fn inject_bytes(&self, data: &[u8]) -> Result<Address> {
+        imp::inject_bytes(self, data).map_err(Error::operation("inject bytes"))
+    }
+
+    /// Starts execution at `entry` in the target process, passing `arg` as the first
+    /// argument (`rdi` on x86-64 Linux, `rcx` on Windows). Blocks until the code returns.
+    ///
+    /// On Windows this creates a remote thread; on Linux it uses ptrace register
+    /// manipulation (x86-64 only). The target must already contain executable code at
+    /// `entry`.
+    pub fn execute_remote(&self, entry: Address, arg: u64) -> Result<u64> {
+        imp::execute_remote(self, entry, arg).map_err(Error::operation("execute remote"))
     }
 
     fn load_via_loader(&self, path: &Path) -> Result<Module> {
