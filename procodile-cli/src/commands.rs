@@ -9,7 +9,7 @@ use procodile::scan::{
     PointerScanOptions, Progress, Scan, ScanOptions, Value, ValueType, filter_pointers,
     find_pattern,
 };
-use procodile::{Address, Module, Protection, Region};
+use procodile::{Address, LoadMethod, Module, Protection, Region};
 
 use crate::cli::*;
 use crate::format::{self, Format};
@@ -299,6 +299,28 @@ fn image(session: &mut Session, command: ImageCommand) -> CmdResult {
             }
             if let Some(region) = handle.region_at(address).map_err(|e| e.to_string())? {
                 println!("       Region: {}", region_line(&region));
+            }
+        }
+        ImageCommand::Inject { method, path } => {
+            let load_method = match method {
+                InjectMethod::Loader => LoadMethod::Loader,
+                InjectMethod::Manual => LoadMethod::ManualMap,
+            };
+            let module = handle
+                .load_library(&path, load_method)
+                .map_err(|e| e.to_string())?;
+            let method_label = match method {
+                InjectMethod::Loader => "loader",
+                InjectMethod::Manual => "manual",
+            };
+            println!(
+                "      Module: {} loaded via {method_label}",
+                module.name.to_string_lossy()
+            );
+            println!("        Base: {}", module.base);
+            println!("        Size: {:#x} ({} bytes)", module.size, module.size);
+            if module.path != std::path::PathBuf::new() {
+                println!("        Path: {}", module.path.display());
             }
         }
     }

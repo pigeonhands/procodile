@@ -181,6 +181,16 @@ pub struct FindArgs {
     pub count: usize,
 }
 
+/// How `image inject` loads the library (mirrors `procodile::LoadMethod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum InjectMethod {
+    /// Use the target's OS loader (LoadLibraryW / dlopen). Default.
+    #[default]
+    Loader,
+    /// Map the image directly without the OS loader.
+    Manual,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ImageCommand {
     /// List loaded modules.
@@ -192,6 +202,22 @@ pub enum ImageCommand {
     Lookup {
         #[arg(short, long)]
         address: String,
+    },
+    /// Load a shared library (.dll / .so) into the attached process.
+    ///
+    /// Uses the OS loader by default (`--method loader`). Pass `--method manual` to map
+    /// the image directly without the loader — useful when dlopen/LoadLibrary cannot be
+    /// used (static/musl targets, stripped symbols, restricted ptrace).
+    ///
+    /// Example:
+    ///   image inject /path/to/library.so
+    ///   image inject -m manual /path/to/library.so
+    Inject {
+        /// How to load the library: `loader` (default) or `manual`.
+        #[arg(short = 'm', long = "method", value_enum, default_value_t = InjectMethod::Loader)]
+        method: InjectMethod,
+        /// Path to the shared library file.
+        path: String,
     },
 }
 
