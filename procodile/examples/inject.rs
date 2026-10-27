@@ -6,26 +6,9 @@
 //! The optional third argument selects the loading method:
 //!   loader  (default) — OS loader (LoadLibraryW / dlopen via ptrace)
 //!   manual             — direct ELF/PE mapping without the OS loader
-//!
-//! To build a small marker library for testing, create `examples/injectme/lib.rs`:
-//!
-//!   // lib.rs
-//!   #[no_mangle]
-//!   pub extern "C" fn procodile_marker() {}
-//!
-//!   #[cfg(target_os = "linux")]
-//!   #[used]
-//!   #[link_section = ".init_array"]
-//!   static INIT: extern "C" fn() = init;
-//!   extern "C" fn init() {
-//!       let _ = std::fs::write("/tmp/procodile_inject_ok", b"ok\n");
-//!   }
-//!
-//! Then: cargo build --example injectme && run this example pointing at the .so.
-//! After injection, `/tmp/procodile_inject_ok` will contain "ok" confirming the
-//! library loaded and its constructor ran.
+//!                        (requires `--features inject`)
 
-use procodile::{Access, LoadMethod, ProcessHandle};
+use procodile::{Access, ProcessHandle};
 
 fn main() -> procodile::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -37,20 +20,25 @@ fn main() -> procodile::Result<()> {
     let path = args
         .next()
         .expect("usage: inject <pid> <path> [loader|manual]");
-    let method = match args.next().as_deref() {
-        Some("manual") => LoadMethod::ManualMap,
-        _ => LoadMethod::Loader,
-    };
+    let manual = args.next().as_deref() == Some("manual");
 
     let handle = ProcessHandle::open(pid, Access::ReadWrite)?;
 
-    let method_label = match method {
-        LoadMethod::Loader => "loader",
-        LoadMethod::ManualMap => "manual",
+    let module = if manual {
+        #[cfg(feature = "inject")]
+        {
+            println!("Injecting {path:?} into pid {pid} via manual map...");
+            handle.inject_file(&path)?
+        }
+        #[cfg(not(feature = "inject"))]
+        {
+            eprintln!("manual mapping requires --features inject");
+            std::process::exit(1);
+        }
+    } else {
+        println!("Injecting {path:?} into pid {pid} via OS loader...");
+        handle.load_library(&path, procodile::LoadMethod::Loader)?
     };
-    println!("Injecting {path:?} into pid {pid} via {method_label}...");
-
-    let module = handle.load_library(&path, method)?;
 
     println!("  Module: {}", module.name.to_string_lossy());
     println!("    Base: {}", module.base);
