@@ -12,6 +12,8 @@ use crate::{Error, Module, ProcessHandle, Result};
 
 /// How a shared library is loaded into the target process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", repr(u8))]
 pub enum LoadMethod {
     /// Use the target's OS loader.
     ///

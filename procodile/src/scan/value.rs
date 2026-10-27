@@ -6,6 +6,8 @@ use crate::Pod;
 /// The type of value a scan looks for. Values are read in the target's native byte order,
 /// which is assumed to match ours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", repr(u8))]
 pub enum ValueType {
     I8,
     U8,
@@ -159,6 +161,8 @@ pub struct ParseValueError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", repr(C))]
 pub enum Value {
     I8(i8),
     U8(u8),

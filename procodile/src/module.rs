@@ -4,7 +4,13 @@ use std::path::PathBuf;
 use crate::{Address, Error, ProcessHandle, Result};
 
 /// An executable image (exe, dll, so) loaded into a process.
+///
+/// Reflected as an opaque type because its `name` and `path` fields are `OsString` /
+/// `PathBuf`, which do not implement `Facet`. The `base` and `size` can be read
+/// directly after casting or through the platform-specific accessors.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", facet(opaque))]
 pub struct Module {
     /// File name, e.g. `game.exe` or `libc.so.6`.
     pub name: OsString,

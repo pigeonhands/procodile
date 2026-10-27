@@ -8,6 +8,7 @@ use std::str::FromStr;
 /// Deliberately not a pointer: it is never dereferenced locally, and unlike raw pointers it
 /// is `Send + Sync`, hashable and supports plain integer arithmetic.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
 #[repr(transparent)]
 pub struct Address(usize);
 

@@ -8,6 +8,8 @@ pub mod memory;
 pub mod module;
 pub mod os;
 pub mod process;
+#[cfg(feature = "reflect")]
+pub mod reflect;
 pub mod scan;
 pub mod structs;
 

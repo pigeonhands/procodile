@@ -6,7 +6,13 @@ use std::path::PathBuf;
 use crate::{Address, Error, ProcessHandle, Result};
 
 /// Page protection of a [`Region`].
+///
+/// Reflected as an opaque type: its semantics are carried by `const` flag values
+/// (`READ`, `WRITE`, …) that a derive macro cannot surface. Inspect them via
+/// [`Protection::contains`] or the named constants on this type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", facet(opaque))]
 pub struct Protection(u8);
 
 impl Protection {
@@ -90,6 +96,8 @@ impl fmt::Debug for Protection {
 
 /// What backs a [`Region`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", repr(u8))]
 pub enum RegionKind {
     /// Anonymous memory owned by the process: heap, stacks, allocations.
     Private,
@@ -100,7 +108,12 @@ pub enum RegionKind {
 }
 
 /// A contiguous range of committed memory with uniform protection.
+///
+/// Reflected as an opaque type because its `path` field is `Option<PathBuf>`, which
+/// does not implement `Facet`. Access `base`, `size`, `protection` and `kind` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "reflect", derive(facet::Facet))]
+#[cfg_attr(feature = "reflect", facet(opaque))]
 pub struct Region {
     pub base: Address,
     pub size: usize,
