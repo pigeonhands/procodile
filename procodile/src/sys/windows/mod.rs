@@ -2,6 +2,7 @@ use std::io;
 
 use windows_sys::core::BOOL;
 
+pub(crate) mod inject;
 pub(crate) mod memory;
 pub(crate) mod module;
 pub(crate) mod process;
