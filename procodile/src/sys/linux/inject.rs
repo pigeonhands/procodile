@@ -57,7 +57,13 @@ pub(crate) fn map_image(
     _hint_name: Option<&OsStr>,
 ) -> io::Result<(Address, usize)> {
     #[cfg(target_arch = "x86_64")]
-    { x86_64::elf_map(handle, image) }
+    {
+        if handle.is_current() {
+            x86_64::elf_map_local(image)
+        } else {
+            x86_64::elf_map(handle, image)
+        }
+    }
     #[cfg(not(target_arch = "x86_64"))]
     { let _ = (handle, image); Err(io::ErrorKind::Unsupported.into()) }
 }
@@ -76,8 +82,16 @@ mod x86_64 {
         PTRACE_SINGLESTEP, pid_t, ptrace, user_regs_struct, waitpid,
     };
 
+    use std::ffi::c_char;
+
     use crate::{Address, ProcessHandle};
     use crate::AsInner;
+
+    const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut std::ffi::c_void, symbol: *const c_char) -> *mut std::ffi::c_void;
+    }
 
     // ─── ptrace helpers ──────────────────────────────────────────────────────
 
@@ -628,6 +642,161 @@ mod x86_64 {
         tracer.detach()?;
 
         Ok((Address::new(mapped_base as usize), aligned_size))
+    }
+
+    // ─── in-process ELF manual mapping ────────────────────────────────────
+
+    #[cfg(feature = "inject")]
+    pub(super) fn elf_map_local(image: &[u8]) -> io::Result<(Address, usize)> {
+        use pewter::elf::{ElfFile, SegmentType};
+
+        let elf = ElfFile::parse(image)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        if !elf.is_64() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "32-bit ELF not supported"));
+        }
+
+        let load_segs: Vec<_> = elf.program_headers.iter()
+            .filter(|p| p.segment_type == SegmentType::Load)
+            .collect();
+        if load_segs.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "no PT_LOAD segments"));
+        }
+
+        let dyn_seg = elf.program_headers.iter()
+            .find(|p| p.segment_type == SegmentType::Dynamic);
+
+        let base_vaddr = load_segs.iter().map(|s| s.vaddr).min().unwrap();
+        let top_vaddr = load_segs.iter().map(|s| s.vaddr + s.memory_size).max().unwrap();
+        let total_size = (top_vaddr - base_vaddr) as usize;
+        let aligned_size = (total_size + 0xfff) & !0xfff;
+
+        let mapped_base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                aligned_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mapped_base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let mapped_base = mapped_base as u64;
+        let delta = mapped_base - base_vaddr;
+
+        for seg in &load_segs {
+            let off = seg.offset as usize;
+            let fsz = seg.file_size as usize;
+            if fsz > 0 && off + fsz <= image.len() {
+                let dst = (seg.vaddr + delta) as *mut u8;
+                unsafe { std::ptr::copy_nonoverlapping(image[off..].as_ptr(), dst, fsz) };
+            }
+        }
+
+        let relative_type = elf.header.machine.relative_relocation_type();
+        let absolute_types = elf.header.machine.absolute_relocation_types();
+        if let Ok(relocations) = elf.relocations() {
+            for r in &relocations {
+                let addend = r.addend.unwrap_or(0) as u64;
+                if Some(r.relocation_type) == relative_type {
+                    let val = (mapped_base as i64 + addend as i64) as u64;
+                    let dst = (r.offset + delta) as *mut u64;
+                    unsafe { dst.write_unaligned(val) };
+                } else if absolute_types.contains(&r.relocation_type) {
+                    let symbols = elf.symbols()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let dynsyms: Vec<_> = symbols.iter().filter(|s| s.dynamic).collect();
+                    if let Some(sym) = dynsyms.get(r.symbol as usize) {
+                        if let Some(addr) = resolve_local_symbol(sym.name) {
+                            let dst = (r.offset + delta) as *mut u64;
+                            unsafe { dst.write_unaligned(addr) };
+                        }
+                    }
+                }
+            }
+        }
+
+        for seg in &load_segs {
+            let addr = (seg.vaddr + delta) as *mut libc::c_void;
+            let size = (seg.memory_size as usize + 0xfff) & !0xfff;
+            let prot = elf_flags_to_prot(seg.flags.bits());
+            unsafe { libc::mprotect(addr, size, prot) };
+        }
+
+        if let Some(dyn_ph) = dyn_seg {
+            call_init_local(image, &elf, delta, dyn_ph.vaddr)?;
+        }
+
+        Ok((Address::new(mapped_base as usize), aligned_size))
+    }
+
+    #[cfg(feature = "inject")]
+    fn resolve_local_symbol(name: &str) -> Option<u64> {
+        let name = std::ffi::CString::new(name).ok()?;
+        let addr = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+        if addr.is_null() { None } else { Some(addr as u64) }
+    }
+
+    #[cfg(feature = "inject")]
+    fn call_init_local(
+        data: &[u8],
+        elf: &pewter::elf::ElfFile<'_>,
+        delta: u64,
+        dyn_vaddr: u64,
+    ) -> io::Result<()> {
+        const DT_NULL: u64 = 0;
+        const DT_INIT: u64 = 12;
+        const DT_INIT_ARRAY: u64 = 25;
+        const DT_INIT_ARRAYSZ: u64 = 27;
+
+        let Some(dyn_off) = elf.vaddr_to_offset(dyn_vaddr) else {
+            return Ok(());
+        };
+
+        let mut init_fn: Option<u64> = None;
+        let mut init_array: Option<u64> = None;
+        let mut init_arraysz: u64 = 0;
+
+        let mut off = dyn_off;
+        loop {
+            if off + 16 > data.len() { break; }
+            let d_tag = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            let d_val = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+            off += 16;
+            match d_tag {
+                DT_NULL => break,
+                DT_INIT => init_fn = Some(d_val + delta),
+                DT_INIT_ARRAY => init_array = Some(d_val + delta),
+                DT_INIT_ARRAYSZ => init_arraysz = d_val,
+                _ => {}
+            }
+        }
+
+        type InitFn = unsafe extern "C" fn();
+        let call = |fn_addr: u64| {
+            let f: InitFn = unsafe { std::mem::transmute(fn_addr) };
+            unsafe { f() };
+        };
+
+        if let Some(f) = init_fn {
+            call(f);
+        }
+        if let Some(arr) = init_array {
+            let count = init_arraysz as usize / 8;
+            for i in 0..count {
+                let slot = (arr + i as u64 * 8) as *const u64;
+                let fn_addr = unsafe { slot.read_unaligned() };
+                if fn_addr != 0 {
+                    call(fn_addr);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Look up an exported symbol in the target's loaded modules using pewter.

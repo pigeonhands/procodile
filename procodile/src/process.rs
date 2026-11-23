@@ -120,6 +120,11 @@ impl ProcessHandle {
         self.0.is_alive()
     }
 
+    /// Returns `true` when this handle refers to the calling process.
+    pub fn is_current(&self) -> bool {
+        self.0.pid() == imp::current_pid()
+    }
+
     /// Stops all threads of the process, e.g. to take a consistent snapshot.
     pub fn suspend(&self) -> Result<()> {
         self.0

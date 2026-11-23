@@ -198,6 +198,17 @@ pub(crate) fn map_image(
     image: &[u8],
     _hint_name: Option<&OsStr>,
 ) -> io::Result<(Address, usize)> {
+    if handle.is_current() {
+        return map_image_local(image);
+    }
+    map_image_remote(handle, image)
+}
+
+#[cfg(feature = "inject")]
+fn map_image_remote(
+    handle: &ProcessHandle,
+    image: &[u8],
+) -> io::Result<(Address, usize)> {
     use pewter::pe::sections::base_relocation::BaseRelocationType;
 
     let pe = pewter::PEImageDef::parse(image)
@@ -296,6 +307,151 @@ pub(crate) fn map_image(
     }
 
     Ok((base, size_of_image))
+}
+
+/// In-process PE manual mapping — no remote threads, direct memory operations.
+#[cfg(feature = "inject")]
+fn map_image_local(image: &[u8]) -> io::Result<(Address, usize)> {
+    use pewter::pe::sections::base_relocation::BaseRelocationType;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+    };
+
+    let pe = pewter::PEImageDef::parse(image)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    if !pe.coff_header.machine.is_64_bit() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "only 64-bit PE supported"));
+    }
+
+    let image_base = pe.optional_header.windows_specific_fields.image_base();
+    let size_of_image = pe.optional_header.windows_specific_fields.size_of_image() as usize;
+    let size_of_headers = pe.optional_header.windows_specific_fields.size_of_headers() as usize;
+    let ep_rva = pe.optional_header.standard_fields.address_of_entry_point as usize;
+
+    let base_ptr = unsafe {
+        VirtualAlloc(std::ptr::null(), size_of_image, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    };
+    if base_ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let base = base_ptr as usize;
+    let delta = base as i64 - image_base as i64;
+
+    // Copy headers.
+    let hdr_len = size_of_headers.min(image.len());
+    unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), base as *mut u8, hdr_len) };
+
+    // Copy sections.
+    for sec in pe.sections.iter() {
+        let raw_size = sec.size_of_raw_data as usize;
+        let raw_off = sec.pointer_to_raw_data as usize;
+        if raw_size == 0 || raw_off >= image.len() { continue; }
+        let src_end = (raw_off + raw_size).min(image.len());
+        let dst = (base + sec.virtual_address as usize) as *mut u8;
+        unsafe { std::ptr::copy_nonoverlapping(image[raw_off..].as_ptr(), dst, src_end - raw_off) };
+    }
+
+    // Base relocations.
+    if delta != 0 {
+        if let Ok(Some(relocs)) = pe.read_base_relocation_table() {
+            for block in relocs.relocations.iter() {
+                for entry in block.table.iter() {
+                    if entry.relocation_type != BaseRelocationType::Dir64 { continue; }
+                    let target = (base + block.base_rva as usize + entry.offset as usize) as *mut u64;
+                    unsafe {
+                        let val = target.read_unaligned();
+                        target.write_unaligned((val as i64 + delta) as u64);
+                    };
+                }
+            }
+        }
+    }
+
+    // Imports — resolve via GetProcAddress in the current process.
+    if let Ok(Some(imports)) = pe.read_import_table() {
+        for entry in imports.entries.iter() {
+            let dll_name: Vec<u16> = entry.dll_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let hmod = unsafe { GetModuleHandleW(dll_name.as_ptr()) };
+
+            let iat_rva = entry.import_directory_table.import_address_table_rva as usize;
+            let mut iat_ptr = (base + iat_rva) as *mut u64;
+
+            for row in entry.import_lookup_table.iter() {
+                let sym_addr = match row {
+                    pewter::pe::sections::idata::ImportTableRow::Ordinal(ord) => {
+                        if hmod.is_null() { None } else {
+                            let f = unsafe { GetProcAddress(hmod, *ord as usize as *const _) };
+                            f.map(|f| f as u64)
+                        }
+                    }
+                    pewter::pe::sections::idata::ImportTableRow::HintName { name, .. } => {
+                        if hmod.is_null() { None } else {
+                            let cname = std::ffi::CString::new(name.as_bytes()).ok();
+                            cname.and_then(|c| {
+                                let f = unsafe { GetProcAddress(hmod, c.as_ptr() as *const _) };
+                                f.map(|f| f as u64)
+                            })
+                        }
+                    }
+                };
+                if let Some(addr) = sym_addr {
+                    unsafe { iat_ptr.write_unaligned(addr) };
+                }
+                iat_ptr = unsafe { iat_ptr.add(1) };
+            }
+        }
+    }
+
+    // Section protections.
+    for sec in pe.sections.iter() {
+        let prot = section_flags_to_win_prot(sec.characteristics);
+        let addr = (base + sec.virtual_address as usize) as *mut std::ffi::c_void;
+        let size = (sec.virtual_size() as usize + 0xfff) & !0xfff;
+        let mut old_prot = 0u32;
+        unsafe { VirtualProtect(addr, size, prot, &mut old_prot) };
+    }
+
+    // TLS callbacks — call directly.
+    if let Ok(Some(tls)) = pe.read_tls_directory() {
+        let callbacks_va = (tls.address_of_callbacks as i64 + delta) as usize;
+        if callbacks_va != 0 {
+            let mut ptr = callbacks_va as *const u64;
+            loop {
+                let fn_addr = unsafe { ptr.read_unaligned() };
+                if fn_addr == 0 { break; }
+                type TlsCallback = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut std::ffi::c_void);
+                let cb: TlsCallback = unsafe { std::mem::transmute(fn_addr) };
+                unsafe { cb(base_ptr, 1 /* DLL_PROCESS_ATTACH */, std::ptr::null_mut()) };
+                ptr = unsafe { ptr.add(1) };
+            }
+        }
+    }
+
+    // Entry point — DllMain(hModule, DLL_PROCESS_ATTACH, NULL).
+    if ep_rva != 0 {
+        type DllMain = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut std::ffi::c_void) -> i32;
+        let entry: DllMain = unsafe { std::mem::transmute(base + ep_rva) };
+        unsafe { entry(base_ptr, 1, std::ptr::null_mut()) };
+    }
+
+    Ok((Address::new(base), size_of_image))
+}
+
+#[cfg(feature = "inject")]
+fn section_flags_to_win_prot(flags: pewter::pe::sections::SectionFlags) -> u32 {
+    use pewter::pe::sections::SectionFlags;
+    use windows_sys::Win32::System::Memory::*;
+    let r = flags.contains(SectionFlags::MEM_READ);
+    let w = flags.contains(SectionFlags::MEM_WRITE);
+    let x = flags.contains(SectionFlags::MEM_EXECUTE);
+    match (r, w, x) {
+        (_, _, true) if w => PAGE_EXECUTE_READWRITE,
+        (_, _, true) => PAGE_EXECUTE_READ,
+        (_, true, _) => PAGE_READWRITE,
+        (true, _, _) => PAGE_READONLY,
+        _ => PAGE_NOACCESS,
+    }
 }
 
 #[cfg(feature = "inject")]
