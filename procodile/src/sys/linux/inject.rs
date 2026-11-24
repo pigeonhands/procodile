@@ -269,16 +269,39 @@ mod x86_64 {
         handle: &ProcessHandle,
         tracer: &PtraceGuard,
         saved: &user_regs_struct,
-        scratch: u64,
+        _scratch: u64,
         fn_addr: u64,
         args: &[u64; 6],
     ) -> io::Result<u64> {
-        let ret_addr = scratch + 4096 - 16;
+        // A dedicated, generous stack for the call. glibc's `dlopen` and
+        // `pthread_create`, and any library constructors (DT_INIT / DT_INIT_ARRAY)
+        // they run, use far more than a page — a few KB overflows into unmapped
+        // memory and faults mid-call. 2 MiB matches a typical default thread
+        // stack. (The caller's `scratch` is for argument data, not the stack.)
+        const CALL_STACK: usize = 2 << 20;
+        // RWX: the `0xcc` return trap lives on this stack and is *executed* when
+        // the called function returns, so the page must be executable.
+        let stack = remote_mmap(
+            handle,
+            tracer,
+            saved,
+            CALL_STACK,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )?;
+
+        // Return onto a 0xcc trap near the top of the stack; the ABI wants
+        // rsp % 16 == 8 on entry (as if reached by a `call`).
+        let ret_addr = stack + CALL_STACK as u64 - 16;
         let trap: [u8; 1] = [0xcc];
         handle.as_inner().mem.write_at(&trap, ret_addr)?;
 
         let mut regs = *saved;
         regs.rip = fn_addr;
+        // If the hijacked thread was stopped inside a syscall (very common — e.g.
+        // blocked in poll/futex/nanosleep), the kernel would otherwise rewind rip
+        // by 2 to "restart" it, landing mid-function and faulting. Clearing
+        // orig_rax disables syscall restart for this call.
+        regs.orig_rax = u64::MAX;
         regs.rdi = args[0];
         regs.rsi = args[1];
         regs.rdx = args[2];
@@ -290,9 +313,22 @@ mod x86_64 {
         handle.as_inner().mem.write_at(&ret_addr.to_le_bytes(), regs.rsp)?;
 
         tracer.setregs(&regs)?;
-        tracer.cont_and_wait()?;
-
+        let status = tracer.cont_and_wait()?;
         let after = tracer.getregs()?;
+
+        // A clean return hits our 0xcc trap (SIGTRAP). Any other stop signal
+        // means the called function faulted — surface it instead of reading a
+        // garbage return value.
+        if libc::WIFSTOPPED(status) {
+            let sig = libc::WSTOPSIG(status);
+            if sig != libc::SIGTRAP {
+                return Err(io::Error::other(format!(
+                    "remote call to 0x{fn_addr:x} faulted with signal {sig} at rip=0x{:x}",
+                    after.rip
+                )));
+            }
+        }
+
         Ok(after.rax)
     }
 
