@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "procodile"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "facet",
  "libc",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "procodile-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "clap",
  "ctrlc",

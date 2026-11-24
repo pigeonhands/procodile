@@ -198,6 +198,30 @@ freezer.unfreeze(id);
 # }
 ```
 
+## Injection
+
+Load a shared library into another process. Via the OS loader the module shows
+up in the target's module list; manual mapping (the optional `inject` feature)
+keeps it out and also covers static/musl targets, stripped binaries and
+ptrace-blocked environments. x86-64 only.
+
+```rust,no_run
+use procodile::{ProcessHandle, LoadMethod};
+
+# fn main() -> procodile::Result<()> {
+let handle = ProcessHandle::open_current()?;
+// Via the OS loader: dlopen through ptrace on Linux, LoadLibraryW on Windows.
+let _module = handle.load_library("payload.so", LoadMethod::Loader)?;
+# Ok(())
+# }
+```
+
+Run an exported entry point in the target with `execute_remote`, or without
+waiting for it with `execute_remote_detached`. With the `inject` feature you can
+also map an image straight from memory with `map_image`, inject a file with
+`inject_file`, pass `LoadMethod::ManualMap` so the library never joins the OS
+module list, and enumerate manually-mapped modules with `mapped_images`.
+
 ## Platform support
 
 | | Linux | Windows |
